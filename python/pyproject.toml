@@ -1,0 +1,77 @@
+[project]
+name = "lance-graph"
+dynamic = ["version"]
+dependencies = ["pyarrow>=14"]
+description = "Python bindings for the lance-graph Cypher engine"
+authors = [{ name = "Lance Devs", email = "dev@lancedb.com" }]
+license = { file = "LICENSE" }
+repository = "https://github.com/lancedb/lance-graph"
+readme = "README.md"
+requires-python = ">=3.9"
+keywords = ["graph", "cypher", "lance", "arrow"]
+categories = ["database", "science"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering",
+]
+
+[tool.maturin]
+python-source = "python"
+
+[build-system]
+requires = ["maturin>=1.4"]
+build-backend = "maturin"
+
+[project.optional-dependencies]
+tests = ["pytest", "pyarrow>=14", "pandas"]
+dev = ["ruff", "pyright"]
+
+[tool.ruff]
+lint.select = ["F", "E", "W", "I", "G", "TCH", "PERF", "B019"]
+
+[tool.ruff.lint.per-file-ignores]
+"*.pyi" = ["E301", "E302"]
+
+[tool.pyright]
+pythonVersion = "3.13"
+include = ["python/lance_graph/__init__.py"]
+# Dependencies like pyarrow make this difficult to enforce strictly.
+reportMissingTypeStubs = "warning"
+reportImportCycles = "error"
+reportUnusedImport = "error"
+reportPropertyTypeMismatch = "error"
+reportUnnecessaryCast = "error"
+
+
+[tool.pytest.ini_options]
+markers = [
+    "cuda: tests which rely on having a CUDA-capable GPU",
+    "integration: mark test to run only on named environment",
+    "gpu: tests which rely on pytorch and some kind of gpu",
+    "slow",
+    "torch: tests which rely on pytorch being installed",
+    "recurring: marks tests as recurring tests",
+]
+filterwarnings = [
+    'error::FutureWarning',
+    'error::DeprecationWarning',
+    # Boto3
+    'ignore:.*datetime\.datetime\.utcnow\(\) is deprecated.*:DeprecationWarning',
+    # Pandas 2.2 on Python 2.12
+    'ignore:.*datetime\.datetime\.utcfromtimestamp\(\) is deprecated.*:DeprecationWarning',
+    # Pytorch 2.2 on Python 2.12
+    'ignore:.*is deprecated and will be removed in Python 3\.14.*:DeprecationWarning',
+    'ignore:.*The distutils package is deprecated.*:DeprecationWarning',
+]
+pythonpath = ["python"]
