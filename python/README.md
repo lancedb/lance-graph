@@ -9,15 +9,31 @@ to manage dependencies inside a project-local `.venv`.
 ```bash
 cd python
 uv venv --python 3.11 .venv
+source .venv/bin/activate
+uv pip install maturin[patchelf]
 uv pip install -e '.[tests]'
-uv run --extra tests pytest python/python/tests/test_graph.py
+maturin develop
+pytest python/tests/ -v
 ```
 
-For linting and type checks install the optional `dev` extra:
+## Development workflow
+
+For linting and type checks:
 
 ```bash
-uv run --extra dev ruff check python
-uv run --extra dev pyright
+# Install dev dependencies
+uv pip install -e '.[dev]'
+
+# Run linters and type checker
+ruff format python/              # format code
+ruff check python/               # lint code
+pyright                          # type check
+
+# Run specific tests
+pytest python/tests/test_graph.py::test_basic_node_selection -v
+
+# Rebuild extension after Rust changes
+maturin develop
 ```
 
 > If another virtual environment is already active, run `deactivate` (or

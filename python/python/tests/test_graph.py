@@ -3,7 +3,6 @@
 
 import pyarrow as pa
 import pytest
-
 from lance_graph import CypherQuery, GraphConfig
 
 

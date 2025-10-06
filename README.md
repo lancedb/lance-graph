@@ -26,8 +26,11 @@ cargo test
 ```bash
 cd python
 uv venv --python 3.11 .venv      # create the local virtualenv
+source .venv/bin/activate         # activate the virtual environment
+uv pip install maturin[patchelf] # install build tool
 uv pip install -e '.[tests]'     # editable install with test extras
-uv run --extra tests pytest python/python/tests/test_graph.py
+maturin develop                   # build and install the Rust extension
+pytest python/tests/ -v          # run the test suite
 ```
 
 > If another virtual environment is already active, run `deactivate` (or
@@ -59,11 +62,19 @@ result = query.execute({"Person": people})
 print(result.to_pydict())  # {'name': ['Bob', 'David'], 'age': [34, 42]}
 ```
 
-Optional linters and type checks:
+### Development workflow
+
+For linting and type checks:
 
 ```bash
-uv run --extra dev ruff check python
-uv run --extra dev pyright
+# Install dev dependencies and run linters
+uv pip install -e '.[dev]'
+ruff format python/              # format code
+ruff check python/               # lint code
+pyright                          # type check
+
+# Or run individual tests
+pytest python/tests/test_graph.py::test_basic_node_selection -v
 ```
 
 The Python README (`python/README.md`) contains additional details if you are
