@@ -7,8 +7,8 @@ on:
     paths:
       - rust/**
       - .github/workflows/build.yml
-      - Cargo.toml
-      - Cargo.lock
+      - rust/lance-graph/Cargo.toml
+      - rust/lance-graph/Cargo.lock
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -37,6 +37,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rust/lance-graph
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y protobuf-compiler
       - name: Build
         run: cargo build --manifest-path rust/lance-graph/Cargo.toml
       - name: Build tests
