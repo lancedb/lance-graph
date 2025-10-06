@@ -1,0 +1,78 @@
+name: Rust Tests
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    paths:
+      - rust/**
+      - .github/workflows/rust-test.yml
+      - Cargo.toml
+      - Cargo.lock
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-C debuginfo=1"
+  RUST_BACKTRACE: "1"
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        toolchain:
+          - stable
+          - nightly
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup rust toolchain
+        run: |
+          rustup toolchain install ${{ matrix.toolchain }}
+          rustup default ${{ matrix.toolchain }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust/lance-graph
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y protobuf-compiler
+      - name: Build tests
+        run: cargo test --manifest-path rust/lance-graph/Cargo.toml --no-run
+      - name: Run unit tests
+        run: cargo test --manifest-path rust/lance-graph/Cargo.toml --lib
+      - name: Run doc tests
+        run: cargo test --manifest-path rust/lance-graph/Cargo.toml --doc
+
+  test-with-coverage:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup rust toolchain
+        run: |
+          rustup toolchain install stable
+          rustup default stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust/lance-graph
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y protobuf-compiler
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Run tests with coverage
+        run: |
+          cargo llvm-cov --manifest-path rust/lance-graph/Cargo.toml --lcov --output-path lcov.info
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: lcov.info
+          flags: rust-unittests
+          fail_ci_if_error: false
