@@ -164,6 +164,21 @@ Numbers are illustrative; your hardware, compiler, and runtime load will affect 
 
 Python bindings for this crate live under `python/src/graph.rs` and expose the same configuration and query APIs via PyO3.
 
+### Python Examples
+
+See `python/examples` for runnable Python examples:
+
+- `basic_cypher.py`: simple node filter and projection against in-memory Arrow batches.
+- `kg_traversal.py`: two-hop traversal on a small synthetic knowledge graph.
+
+Setup and run (from repo root):
+
+```bash
+maturin develop -m python/Cargo.toml
+python python/examples/basic_cypher.py
+python python/examples/kg_traversal.py
+```
+
 ## License
 
 Apache-2.0. See the top-level LICENSE file for details.
