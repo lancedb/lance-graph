@@ -31,6 +31,7 @@ pub struct BackgroundExecutor {
 }
 
 impl BackgroundExecutor {
+    #[allow(dead_code)]
     pub fn get_runtime_handle(&self) -> Option<tokio::runtime::Handle> {
         Some(self.runtime.handle().clone())
     }
@@ -50,6 +51,7 @@ impl BackgroundExecutor {
     ///
     /// This method is safe to use with inputs that may reference a Rust async
     /// runtime.
+    #[allow(dead_code)]
     pub fn spawn<T>(&self, py: Option<Python<'_>>, task: T) -> PyResult<T::Output>
     where
         T: Future + Send + 'static,
@@ -63,6 +65,7 @@ impl BackgroundExecutor {
         }
     }
 
+    #[allow(dead_code)]
     fn spawn_impl<T>(&self, task: T) -> PyResult<T::Output>
     where
         T: Future + Send + 'static,
@@ -103,6 +106,7 @@ impl BackgroundExecutor {
     }
 
     /// Spawn a task in the background
+    #[allow(dead_code)]
     pub fn spawn_background<T>(&self, py: Option<Python<'_>>, task: T)
     where
         T: Future + Send + 'static,
