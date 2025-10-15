@@ -7,7 +7,7 @@ Requirements:
 - Python deps: pyarrow
 
 Run:
-  python python/examples/kg_traversal.py
+  python examples/kg_traversal.py
 """
 
 from __future__ import annotations
@@ -63,5 +63,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-

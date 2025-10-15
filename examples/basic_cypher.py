@@ -7,7 +7,7 @@ Requirements:
 - Python deps: pyarrow
 
 Run:
-  python python/examples/basic_cypher.py
+  python examples/basic_cypher.py
 """
 
 from __future__ import annotations
@@ -49,5 +49,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
