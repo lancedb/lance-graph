@@ -759,6 +759,74 @@ impl CypherQuery {
             message: "Graph configuration is required for execution".to_string(),
             location: snafu::Location::new(file!(), line!(), column!()),
         })?;
+
+        // Handle single-segment variable-length paths by unrolling ranges (*1..N, capped)
+        if path.segments.len() == 1 {
+            if let Some(length_range) = &path.segments[0].relationship.length {
+                let cap: u32 = crate::MAX_VARIABLE_LENGTH_HOPS;
+                let min_len = length_range.min.unwrap_or(1).max(1);
+                let max_len = length_range.max.unwrap_or(cap);
+
+                if min_len > max_len {
+                    return Err(GraphError::InvalidPattern {
+                        message: format!(
+                            "Invalid variable-length range: min {:?} greater than max {:?}",
+                            length_range.min, length_range.max
+                        ),
+                        location: snafu::Location::new(file!(), line!(), column!()),
+                    });
+                }
+
+                if max_len > cap {
+                    return Err(GraphError::UnsupportedFeature {
+                        feature: format!(
+                            "Variable-length paths with length > {} are not supported (got {:?}..{:?})",
+                            cap, length_range.min, length_range.max
+                        ),
+                        location: snafu::Location::new(file!(), line!(), column!()),
+                    });
+                }
+
+                use datafusion::dataframe::DataFrame;
+                let mut union_df: Option<DataFrame> = None;
+
+                for hops in min_len..=max_len {
+                    // Build a fixed-length synthetic path by repeating the single segment
+                    let mut synthetic = crate::ast::PathPattern {
+                        start_node: path.start_node.clone(),
+                        segments: Vec::with_capacity(hops as usize),
+                    };
+
+                    for i in 0..hops {
+                        let mut seg = path.segments[0].clone();
+                        // Drop variables to avoid alias collisions on repeated hops
+                        seg.relationship.variable = None;
+                        if (i + 1) < hops {
+                            seg.end_node.variable = None; // intermediate hop
+                        }
+                        // Clear length spec for this fixed hop
+                        seg.relationship.length = None;
+                        synthetic.segments.push(seg);
+                    }
+
+                    let exec = PathExecutor::new(ctx, cfg, &synthetic)?;
+                    let mut df = exec.build_chain().await?;
+                    df = exec.apply_where(df, &self.ast)?;
+                    df = exec.apply_return(df, &self.ast)?;
+
+                    union_df = Some(match union_df {
+                        Some(acc) => acc.union(df).map_err(|e| GraphError::PlanError {
+                            message: format!("Failed to UNION variable-length paths: {}", e),
+                            location: snafu::Location::new(file!(), line!(), column!()),
+                        })?,
+                        None => df,
+                    });
+                }
+
+                return Ok(union_df);
+            }
+        }
+
         let exec = PathExecutor::new(ctx, cfg, path)?;
         let df = exec.build_chain().await?;
         let df = exec.apply_where(df, &self.ast)?;
