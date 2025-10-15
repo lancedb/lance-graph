@@ -1,26 +1,47 @@
 # Examples for lance-graph
 
-## Setup
+## How to Run Examples
 
-From repo root, build/install the Python bindings for development:
+Pick one of the two approaches:
+
+### 1) Local build (editable) with maturin
 
 ```bash
+# From the repo root; installs the Python extension in editable mode
 maturin develop -m python/Cargo.toml
+
+# Run examples
+python examples/basic_cypher.py
+python examples/kg_traversal.py
 ```
 
-Ensure Python has `pyarrow` available (e.g., `pip install pyarrow`).
-
-### Run with uv (optional)
-
-If you prefer `uv` for isolation without global installs:
+With `uv`:
 
 ```bash
-# Build/install the Python bindings (editable) using uvx + maturin
+# Build/install using uv
 uvx --from maturin maturin develop -m python/Cargo.toml
 
-# Run examples with uv; point PYTHONPATH to the source package
-PYTHONPATH=python/python uv run --with pyarrow python examples/basic_cypher.py
-PYTHONPATH=python/python uv run --with pyarrow python examples/kg_traversal.py
+# Run examples (uv provides pyarrow; no PYTHONPATH needed after develop)
+uv run --with pyarrow python examples/basic_cypher.py
+uv run --with pyarrow python examples/kg_traversal.py
+```
+
+### 2) Install the package, then run
+
+- From PyPI (when published):
+
+```bash
+pip install lance-graph pyarrow
+python examples/basic_cypher.py
+python examples/kg_traversal.py
+```
+
+- From git (editable):
+
+```bash
+pip install -e python
+python examples/basic_cypher.py
+python examples/kg_traversal.py
 ```
 
 ## Examples
@@ -36,5 +57,3 @@ python examples/basic_cypher.py
 ```bash
 python examples/kg_traversal.py
 ```
-
-

@@ -174,9 +174,21 @@ See top-level `examples/` for runnable Python examples:
 Setup and run (from repo root):
 
 ```bash
+Option A - Local build (editable):
+
+```bash
 maturin develop -m python/Cargo.toml
 python examples/basic_cypher.py
 python examples/kg_traversal.py
+```
+
+Option B - Using uv:
+
+```bash
+uvx --from maturin maturin develop -m python/Cargo.toml
+uv run --with pyarrow python examples/basic_cypher.py
+uv run --with pyarrow python examples/kg_traversal.py
+```
 ```
 
 ## License
