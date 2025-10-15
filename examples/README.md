@@ -1,4 +1,4 @@
-# Python Examples for lance-graph
+# Examples for lance-graph
 
 ## Setup
 
@@ -15,13 +15,13 @@ Ensure Python has `pyarrow` available (e.g., `pip install pyarrow`).
 - `basic_cypher.py`: simple node filter and projection.
 
 ```bash
-python python/examples/basic_cypher.py
+python examples/basic_cypher.py
 ```
 
 - `kg_traversal.py`: multi-hop traversal on a small synthetic knowledge graph.
 
 ```bash
-python python/examples/kg_traversal.py
+python examples/kg_traversal.py
 ```
 
 

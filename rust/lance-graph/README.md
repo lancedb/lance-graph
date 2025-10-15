@@ -166,7 +166,7 @@ Python bindings for this crate live under `python/src/graph.rs` and expose the s
 
 ### Python Examples
 
-See `python/examples` for runnable Python examples:
+See top-level `examples/` for runnable Python examples:
 
 - `basic_cypher.py`: simple node filter and projection against in-memory Arrow batches.
 - `kg_traversal.py`: two-hop traversal on a small synthetic knowledge graph.
@@ -175,8 +175,8 @@ Setup and run (from repo root):
 
 ```bash
 maturin develop -m python/Cargo.toml
-python python/examples/basic_cypher.py
-python python/examples/kg_traversal.py
+python examples/basic_cypher.py
+python examples/kg_traversal.py
 ```
 
 ## License
