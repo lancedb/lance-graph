@@ -11,7 +11,7 @@
 //!
 //! - Cypher query parsing and AST representation
 //! - Graph pattern matching on columnar data
-//! - Property graph interpretation of Lance datasets  
+//! - Property graph interpretation of Lance datasets
 //! - Translation to optimized SQL via DataFusion
 //! - Support for nodes, relationships, and properties
 //!
@@ -46,6 +46,9 @@ pub mod query;
 pub mod query_processor;
 pub mod semantic;
 pub mod source_catalog;
+
+/// Maximum allowed hops for variable-length relationship expansion (e.g., *1..N)
+pub const MAX_VARIABLE_LENGTH_HOPS: u32 = 20;
 
 pub use config::{GraphConfig, NodeMapping, RelationshipMapping};
 pub use error::{GraphError, Result};

@@ -2,30 +2,40 @@
 
 ## Building the project
 
-This project is built with [maturin](https://github.com/PyO3/maturin).
+This project is built with [maturin](https://github.com/PyO3/maturin) and uses
+[uv](https://docs.astral.sh/uv/) to manage a local virtual environment.
 
-It can be built in development mode with:
+Recommended uv workflow:
 
 ```shell
+cd python
+uv venv --python 3.11 .venv
+source .venv/bin/activate
+uv pip install maturin[patchelf]
+uv pip install -e '.[tests]'
 maturin develop
 ```
 
-This builds the Rust native module in place. You will need to re-run this
-whenever you change the Rust code. But changing the Python code doesn't require
-re-building.
+Notes:
+- If another virtual environment is active, run `deactivate` first so uv binds to `.venv`.
+- After changing Rust code, re-run `maturin develop`. Pure-Python changes do not require rebuilds.
 
 ## Running tests
 
-To run the tests, first install the test packages:
+You can run tests either via the Makefile (uses uv under the hood) or directly with uv.
+
+Using Makefile (recommended):
 
 ```shell
-pip install '.[tests]'
+cd python
+make test
 ```
 
-then:
+Directly with uv:
 
 ```shell
-make test
+cd python
+uv run pytest -v python/python/tests
 ```
 
 To check the documentation examples, use
@@ -72,7 +82,7 @@ From now any, any attempt to commit, will first run the linters against the
 modified files:
 
 ```shell
-$ git commit -m"Changed some python files"
+$ git commit -m "Changed some python files"
 black....................................................................Passed
 isort (python)...........................................................Passed
 ruff.....................................................................Passed

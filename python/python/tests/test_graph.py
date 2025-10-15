@@ -158,7 +158,6 @@ def test_two_hop_friends_of_friends(graph_env):
     assert set(data["c_id"]) == {4}
 
 
-@pytest.mark.xfail(reason="Variable-length path (*1..2) support pending in executor")
 def test_variable_length_path(graph_env):
     config, datasets, _ = graph_env
     query = CypherQuery(
