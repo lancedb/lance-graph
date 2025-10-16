@@ -79,3 +79,38 @@ pytest python/tests/test_graph.py::test_basic_node_selection -v
 
 The Python README (`python/README.md`) contains additional details if you are
 working solely on the bindings.
+
+## Benchmarks
+
+- Requirements:
+  - protoc: install `protobuf-compiler` (Debian/Ubuntu: `sudo apt-get install -y protobuf-compiler`).
+  - Optional: gnuplot for Criterion's gnuplot backend; otherwise the plotters backend is used.
+
+- Run (from `rust/lance-graph`):
+
+```bash
+cargo bench --bench graph_execution
+
+# Quicker local run (shorter warm-up/measurement):
+cargo bench --bench graph_execution -- --warm-up-time 1 --measurement-time 2 --sample-size 10
+```
+
+- Reports:
+  - Global index: `rust/lance-graph/target/criterion/report/index.html`
+  - Group index: `rust/lance-graph/target/criterion/cypher_execution/report/index.html`
+
+- Typical results (x86_64, quick run: warm-up 1s, measurement 2s, sample size 10):
+
+| Benchmark                | Size      | Median time | Approx. throughput |
+|--------------------------|-----------|-------------|--------------------|
+| basic_node_filter        | 100       | ~680 µs     | ~147 Kelem/s       |
+| basic_node_filter        | 10,000    | ~715 µs     | ~13.98 Melem/s     |
+| basic_node_filter        | 1,000,000 | ~743 µs     | ~1.35 Gelem/s      |
+| single_hop_expand        | 100       | ~2.79 ms    | ~35.9 Kelem/s      |
+| single_hop_expand        | 10,000    | ~3.77 ms    | ~2.65 Melem/s      |
+| single_hop_expand        | 1,000,000 | ~3.70 ms    | ~270 Melem/s       |
+| two_hop_expand           | 100       | ~4.52 ms    | ~22.1 Kelem/s      |
+| two_hop_expand           | 10,000    | ~6.41 ms    | ~1.56 Melem/s      |
+| two_hop_expand           | 1,000,000 | ~6.16 ms    | ~162 Melem/s       |
+
+Numbers are illustrative; your hardware, compiler, and runtime load will affect results.
