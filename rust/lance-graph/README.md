@@ -131,34 +131,10 @@ See the repository root `README.md` for benchmark setup, run commands, and repor
 
 ## Python Bindings
 
-Python bindings for this crate live under `python/src/graph.rs` and expose the same configuration and query APIs via PyO3.
+See the Python package docs for setup and development:
 
-### Python Examples
-
-See top-level `examples/` for runnable Python examples:
-
-- `basic_cypher.py`: simple node filter and projection against in-memory Arrow batches.
-- `kg_traversal.py`: two-hop traversal on a small synthetic knowledge graph.
-
-Setup and run (from repo root):
-
-```bash
-Option A - Local build (editable):
-
-```bash
-maturin develop -m python/Cargo.toml
-python examples/basic_cypher.py
-python examples/kg_traversal.py
-```
-
-Option B - Using uv:
-
-```bash
-uvx --from maturin maturin develop -m python/Cargo.toml
-uv run --with pyarrow python examples/basic_cypher.py
-uv run --with pyarrow python examples/kg_traversal.py
-```
-```
+- Python package README: `python/README.md`
+- Runnable examples (from repo root): `examples/README.md`
 
 ## License
 
