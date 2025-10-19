@@ -146,6 +146,14 @@ impl DataFusionPlanner {
                     .build()
                     .unwrap())
             }
+            LogicalOperator::Offset { input, offset } => {
+                let input_plan = self.plan_operator_with_ctx(input, var_labels)?;
+                Ok(LogicalPlanBuilder::from(input_plan)
+                    .limit((*offset) as usize, None)
+                    .unwrap()
+                    .build()
+                    .unwrap())
+            }
             LogicalOperator::Expand {
                 input,
                 source_variable,

@@ -23,6 +23,8 @@ pub struct CypherQuery {
     pub limit: Option<u64>,
     /// ORDER BY clause (optional)
     pub order_by: Option<OrderByClause>,
+    /// SKIP/OFFSET clause (optional)
+    pub skip: Option<u64>,
 }
 
 impl CypherQuery {

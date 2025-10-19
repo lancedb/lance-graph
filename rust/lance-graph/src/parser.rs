@@ -45,7 +45,7 @@ fn cypher_query(input: &str) -> IResult<&str, CypherQuery> {
     let (input, where_clause) = opt(where_clause)(input)?;
     let (input, return_clause) = return_clause(input)?;
     let (input, order_by) = opt(order_by_clause)(input)?;
-    let (input, limit) = opt(limit_clause)(input)?;
+    let (input, (skip, limit)) = pagination_clauses(input)?;
     let (input, _) = multispace0(input)?;
 
     Ok((
@@ -56,6 +56,7 @@ fn cypher_query(input: &str) -> IResult<&str, CypherQuery> {
             return_clause,
             limit,
             order_by,
+            skip,
         },
     ))
 }
@@ -389,6 +390,49 @@ fn limit_clause(input: &str) -> IResult<&str, u64> {
     Ok((input, limit as u64))
 }
 
+// Parse a SKIP clause
+fn skip_clause(input: &str) -> IResult<&str, u64> {
+    let (input, _) = multispace0(input)?;
+    let (input, _) = tag_no_case("SKIP")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, skip) = integer_literal(input)?;
+
+    Ok((input, skip as u64))
+}
+
+// Parse pagination clauses (SKIP and LIMIT)
+fn pagination_clauses(input: &str) -> IResult<&str, (Option<u64>, Option<u64>)> {
+    let (mut remaining, _) = multispace0(input)?;
+    let mut skip: Option<u64> = None;
+    let mut limit: Option<u64> = None;
+
+    loop {
+        let before = remaining;
+
+        if skip.is_none() {
+            if let Ok((i, s)) = skip_clause(remaining) {
+                skip = Some(s);
+                remaining = i;
+                continue;
+            }
+        }
+
+        if limit.is_none() {
+            if let Ok((i, l)) = limit_clause(remaining) {
+                limit = Some(l);
+                remaining = i;
+                continue;
+            }
+        }
+
+        if before == remaining {
+            break;
+        }
+    }
+
+    Ok((remaining, (skip, limit)))
+}
+
 // Helper parsers
 
 // Parse an identifier
@@ -571,5 +615,42 @@ mod tests {
         let result = parse_cypher_query(query).unwrap();
 
         assert_eq!(result.limit, Some(10));
+    }
+
+    #[test]
+    fn test_parse_query_with_skip() {
+        let query = "MATCH (n:Person) RETURN n.name SKIP 5";
+        let result = parse_cypher_query(query).unwrap();
+
+        assert_eq!(result.skip, Some(5));
+        assert_eq!(result.limit, None);
+    }
+
+    #[test]
+    fn test_parse_query_with_skip_and_limit() {
+        let query = "MATCH (n:Person) RETURN n.name SKIP 5 LIMIT 10";
+        let result = parse_cypher_query(query).unwrap();
+
+        assert_eq!(result.skip, Some(5));
+        assert_eq!(result.limit, Some(10));
+    }
+
+    #[test]
+    fn test_parse_query_with_skip_and_order_by() {
+        let query = "MATCH (n:Person) RETURN n.name ORDER BY n.age SKIP 5";
+        let result = parse_cypher_query(query).unwrap();
+
+        assert_eq!(result.skip, Some(5));
+        assert!(result.order_by.is_some());
+    }
+
+    #[test]
+    fn test_parse_query_with_skip_order_by_and_limit() {
+        let query = "MATCH (n:Person) RETURN n.name ORDER BY n.age SKIP 5 LIMIT 10";
+        let result = parse_cypher_query(query).unwrap();
+
+        assert_eq!(result.skip, Some(5));
+        assert_eq!(result.limit, Some(10));
+        assert!(result.order_by.is_some());
     }
 }
