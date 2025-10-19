@@ -192,14 +192,23 @@ impl CypherQuery {
             })?;
         }
 
-        // Apply LIMIT if present
-        if let Some(limit) = self.ast.limit {
-            df = df
-                .limit(0, Some(limit as usize))
-                .map_err(|e| GraphError::PlanError {
-                    message: format!("Failed to apply LIMIT: {}", e),
-                    location: snafu::Location::new(file!(), line!(), column!()),
-                })?;
+        // Apply ORDER BY if present
+        if let Some(order_by) = &self.ast.order_by {
+            let sort_expr = to_df_order_by_expr_simple(&order_by.items);
+            df = df.sort(sort_expr).map_err(|e| GraphError::PlanError {
+                message: format!("Failed to apply ORDER BY: {}", e),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            })?;
+        }
+
+        // Apply SKIP/OFFSET and LIMIT if present
+        if self.ast.skip.is_some() || self.ast.limit.is_some() {
+            let offset = self.ast.skip.unwrap_or(0) as usize;
+            let fetch = self.ast.limit.map(|l| l as usize);
+            df = df.limit(offset, fetch).map_err(|e| GraphError::PlanError {
+                message: format!("Failed to apply SKIP/LIMIT: {}", e),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            })?;
         }
 
         // Collect results and concat into a single RecordBatch
@@ -1022,6 +1031,7 @@ pub struct CypherQueryBuilder {
     order_by_items: Vec<crate::ast::OrderByItem>,
     limit: Option<u64>,
     distinct: bool,
+    skip: Option<u64>,
     config: Option<GraphConfig>,
     parameters: HashMap<String, serde_json::Value>,
 }
@@ -1078,6 +1088,12 @@ impl CypherQueryBuilder {
         self
     }
 
+    /// Add a SKIP clause
+    pub fn skip(mut self, skip: u64) -> Self {
+        self.skip = Some(skip);
+        self
+    }
+
     /// Build the final CypherQuery
     pub fn build(self) -> Result<CypherQuery> {
         if self.match_clauses.is_empty() {
@@ -1111,6 +1127,7 @@ impl CypherQueryBuilder {
                 })
             },
             limit: self.limit,
+            skip: self.skip,
         };
 
         // Generate query text from AST (simplified)
@@ -1188,6 +1205,26 @@ fn to_df_boolean_expr_simple(
         ))),
         _ => None,
     }
+}
+
+/// Build ORDER BY expressions for simple queries (single table)
+fn to_df_order_by_expr_simple(
+    items: &[crate::ast::OrderByItem],
+) -> Vec<datafusion::logical_expr::SortExpr> {
+    use datafusion::logical_expr::SortExpr;
+
+    items
+        .iter()
+        .map(|item| {
+            let expr = to_df_value_expr_simple(&item.expression);
+            let asc = matches!(item.direction, crate::ast::SortDirection::Ascending);
+            SortExpr {
+                expr,
+                asc,
+                nulls_first: false,
+            }
+        })
+        .collect()
 }
 
 fn to_df_value_expr_simple(expr: &crate::ast::ValueExpression) -> datafusion::logical_expr::Expr {
@@ -1369,5 +1406,116 @@ mod tests {
         assert_eq!(got.len(), 2);
         assert!(got.contains(&"Bob".to_string()));
         assert!(got.contains(&"Carol".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_execute_order_by_asc() {
+        use arrow_array::{Int64Array, RecordBatch, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        // name, age (int)
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("age", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["Bob", "Alice", "David", "Carol"])),
+                Arc::new(Int64Array::from(vec![34, 28, 42, 29])),
+            ],
+        )
+        .unwrap();
+
+        let cfg = GraphConfig::builder()
+            .with_node_label("Person", "id")
+            .build()
+            .unwrap();
+
+        // Order ascending by age
+        let q = CypherQuery::new("MATCH (p:Person) RETURN p.name, p.age ORDER BY p.age ASC")
+            .unwrap()
+            .with_config(cfg);
+
+        let mut data = HashMap::new();
+        data.insert("people".to_string(), batch);
+
+        let out = q.execute(data).await.unwrap();
+        let ages = out.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        let collected: Vec<i64> = (0..out.num_rows()).map(|i| ages.value(i)).collect();
+        assert_eq!(collected, vec![28, 29, 34, 42]);
+    }
+
+    #[tokio::test]
+    async fn test_execute_order_by_desc_with_skip_limit() {
+        use arrow_array::{Int64Array, RecordBatch, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("age", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["Bob", "Alice", "David", "Carol"])),
+                Arc::new(Int64Array::from(vec![34, 28, 42, 29])),
+            ],
+        )
+        .unwrap();
+
+        let cfg = GraphConfig::builder()
+            .with_node_label("Person", "id")
+            .build()
+            .unwrap();
+
+        // Desc by age, skip 1 (drop 42), take 2 -> [34, 29]
+        let q =
+            CypherQuery::new("MATCH (p:Person) RETURN p.age ORDER BY p.age DESC SKIP 1 LIMIT 2")
+                .unwrap()
+                .with_config(cfg);
+
+        let mut data = HashMap::new();
+        data.insert("people".to_string(), batch);
+
+        let out = q.execute(data).await.unwrap();
+        assert_eq!(out.num_rows(), 2);
+        let ages = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let collected: Vec<i64> = (0..out.num_rows()).map(|i| ages.value(i)).collect();
+        assert_eq!(collected, vec![34, 29]);
+    }
+
+    #[tokio::test]
+    async fn test_execute_skip_without_limit() {
+        use arrow_array::{Int64Array, RecordBatch};
+        use arrow_schema::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("age", DataType::Int64, true)]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vec![10, 20, 30, 40]))],
+        )
+        .unwrap();
+
+        let cfg = GraphConfig::builder()
+            .with_node_label("Person", "id")
+            .build()
+            .unwrap();
+
+        let q = CypherQuery::new("MATCH (p:Person) RETURN p.age ORDER BY p.age ASC SKIP 2")
+            .unwrap()
+            .with_config(cfg);
+
+        let mut data = HashMap::new();
+        data.insert("people".to_string(), batch);
+
+        let out = q.execute(data).await.unwrap();
+        assert_eq!(out.num_rows(), 2);
+        let ages = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let collected: Vec<i64> = (0..out.num_rows()).map(|i| ages.value(i)).collect();
+        assert_eq!(collected, vec![30, 40]);
     }
 }

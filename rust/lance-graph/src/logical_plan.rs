@@ -72,6 +72,12 @@ pub enum LogicalOperator {
         sort_items: Vec<SortItem>,
     },
 
+    /// Apply SKIP/OFFSET
+    Offset {
+        input: Box<LogicalOperator>,
+        offset: u64,
+    },
+
     /// Apply LIMIT
     Limit {
         input: Box<LogicalOperator>,
@@ -144,6 +150,14 @@ impl LogicalPlanner {
                         direction: item.direction.clone(),
                     })
                     .collect(),
+            };
+        }
+
+        // Apply SKIP/OFFSET if present
+        if let Some(skip) = query.skip {
+            plan = LogicalOperator::Offset {
+                input: Box::new(plan),
+                offset: skip,
             };
         }
 
@@ -338,6 +352,7 @@ impl LogicalPlanner {
             LogicalOperator::Project { input, .. } => self.extract_variable_from_plan(input),
             LogicalOperator::Distinct { input } => self.extract_variable_from_plan(input),
             LogicalOperator::Sort { input, .. } => self.extract_variable_from_plan(input),
+            LogicalOperator::Offset { input, .. } => self.extract_variable_from_plan(input),
             LogicalOperator::Limit { input, .. } => self.extract_variable_from_plan(input),
             LogicalOperator::Join { left, right, .. } => {
                 // Prefer the right branch's tail variable, else fall back to left
@@ -793,6 +808,56 @@ mod tests {
                 }
             }
             _ => panic!("Expected Limit at top level"),
+        }
+    }
+
+    #[test]
+    fn test_order_skip_limit_wrapping() {
+        // ORDER BY + SKIP + LIMIT should be Limit(Offset(Sort(Project(..))))
+        let q = "MATCH (n:Person) RETURN n.name ORDER BY n.name SKIP 5 LIMIT 10";
+        let ast = parse_cypher_query(q).unwrap();
+        let mut planner = LogicalPlanner::new();
+        let logical = planner.plan(&ast).unwrap();
+        match logical {
+            LogicalOperator::Limit { input, count } => {
+                assert_eq!(count, 10);
+                match *input {
+                    LogicalOperator::Offset {
+                        input: inner,
+                        offset,
+                    } => {
+                        assert_eq!(offset, 5);
+                        match *inner {
+                            LogicalOperator::Sort { input: inner2, .. } => match *inner2 {
+                                LogicalOperator::Project { .. } => {}
+                                _ => panic!("Expected Project under Sort"),
+                            },
+                            _ => panic!("Expected Sort under Offset"),
+                        }
+                    }
+                    _ => panic!("Expected Offset under Limit"),
+                }
+            }
+            _ => panic!("Expected Limit at top level"),
+        }
+    }
+
+    #[test]
+    fn test_skip_only_wrapping() {
+        // SKIP only should be Offset(Project(..))
+        let q = "MATCH (n:Person) RETURN n.name SKIP 3";
+        let ast = parse_cypher_query(q).unwrap();
+        let mut planner = LogicalPlanner::new();
+        let logical = planner.plan(&ast).unwrap();
+        match logical {
+            LogicalOperator::Offset { input, offset } => {
+                assert_eq!(offset, 3);
+                match *input {
+                    LogicalOperator::Project { .. } => {}
+                    _ => panic!("Expected Project under Offset"),
+                }
+            }
+            _ => panic!("Expected Offset at top level"),
         }
     }
 

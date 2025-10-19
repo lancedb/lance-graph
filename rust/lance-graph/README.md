@@ -98,10 +98,10 @@ A builder (`CypherQueryBuilder`) is also available for constructing queries prog
 - Node patterns `(:Label)` with optional variables.
 - Relationship patterns with fixed direction and type, including multi-hop paths.
 - Property comparisons against literal values with `AND`/`OR`/`NOT`/`EXISTS`.
-- RETURN lists of property accesses, optional `DISTINCT`, and `LIMIT`.
+- RETURN lists of property accesses, optional `DISTINCT`, `ORDER BY`, `SKIP` (offset), and `LIMIT`.
 - Positional and named parameters (e.g. `$min_age`).
 
-Features such as ORDER BY, aggregations, optional matches, and subqueries are parsed but not executed yet.
+Features such as aggregations, optional matches, and subqueries are parsed but not executed yet.
 
 ## Crate Layout
 

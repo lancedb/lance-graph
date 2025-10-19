@@ -50,13 +50,37 @@ pub(super) fn apply_return_with_qualifier(
             location: snafu::Location::new(file!(), line!(), column!()),
         })?;
     }
-    if let Some(limit) = ast.limit {
-        df = df
-            .limit(0, Some(limit as usize))
-            .map_err(|e| GraphError::PlanError {
-                message: format!("Failed to apply LIMIT: {}", e),
+    // ORDER BY
+    if let Some(order_by) = &ast.order_by {
+        use datafusion::logical_expr::SortExpr;
+        let mut sorts: Vec<SortExpr> = Vec::new();
+        for item in &order_by.items {
+            if let crate::ast::ValueExpression::Property(prop) = &item.expression {
+                let col_name = qualify(&prop.variable, &prop.property);
+                let col = datafusion::logical_expr::col(col_name);
+                let asc = matches!(item.direction, crate::ast::SortDirection::Ascending);
+                sorts.push(SortExpr {
+                    expr: col,
+                    asc,
+                    nulls_first: false,
+                });
+            }
+        }
+        if !sorts.is_empty() {
+            df = df.sort(sorts).map_err(|e| GraphError::PlanError {
+                message: format!("Failed to apply ORDER BY: {}", e),
                 location: snafu::Location::new(file!(), line!(), column!()),
             })?;
+        }
+    }
+    // SKIP/OFFSET and LIMIT
+    if ast.skip.is_some() || ast.limit.is_some() {
+        let offset = ast.skip.unwrap_or(0) as usize;
+        let fetch = ast.limit.map(|l| l as usize);
+        df = df.limit(offset, fetch).map_err(|e| GraphError::PlanError {
+            message: format!("Failed to apply SKIP/LIMIT: {}", e),
+            location: snafu::Location::new(file!(), line!(), column!()),
+        })?;
     }
     Ok(df)
 }
