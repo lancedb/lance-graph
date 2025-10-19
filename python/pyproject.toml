@@ -28,6 +28,7 @@ classifiers = [
 
 [tool.maturin]
 python-source = "python"
+python-packages = ["lance_graph", "knowledge_graph"]
 
 [build-system]
 requires = ["maturin>=1.4"]
@@ -36,6 +37,9 @@ build-backend = "maturin"
 [project.optional-dependencies]
 tests = ["pytest", "pyarrow>=14", "pandas"]
 dev = ["ruff", "pyright"]
+
+[project.scripts]
+knowledge_graph = "knowledge_graph.main:main"
 
 [tool.ruff]
 lint.select = ["F", "E", "W", "I", "G", "TCH", "PERF", "B019"]
