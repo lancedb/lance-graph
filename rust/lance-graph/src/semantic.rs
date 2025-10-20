@@ -135,6 +135,8 @@ impl SemanticAnalyzer {
 
                 // Register variables in each segment
                 for segment in &path.segments {
+                    // Validate relationship length constraints if present
+                    self.validate_length_range(&segment.relationship)?;
                     // Register relationship variable if present
                     if let Some(rel_var) = &segment.relationship.variable {
                         self.register_relationship_variable(rel_var, &segment.relationship)?;
@@ -151,26 +153,31 @@ impl SemanticAnalyzer {
     /// Register a node variable
     fn register_node_variable(&mut self, node: &NodePattern) -> Result<()> {
         if let Some(var_name) = &node.variable {
-            let var_info = VariableInfo {
-                name: var_name.clone(),
-                variable_type: VariableType::Node,
-                labels: node.labels.clone(),
-                properties: node.properties.keys().cloned().collect(),
-                defined_in: self.current_scope.clone(),
-            };
-
-            if self.variables.contains_key(var_name) {
-                // Variable redefinition - check if it's consistent
-                let existing = &self.variables[var_name];
+            if let Some(existing) = self.variables.get_mut(var_name) {
                 if existing.variable_type != VariableType::Node {
                     return Err(GraphError::PlanError {
                         message: format!("Variable '{}' redefined with different type", var_name),
                         location: snafu::Location::new(file!(), line!(), column!()),
                     });
                 }
+                for label in &node.labels {
+                    if !existing.labels.contains(label) {
+                        existing.labels.push(label.clone());
+                    }
+                }
+                for prop in node.properties.keys() {
+                    existing.properties.insert(prop.clone());
+                }
+            } else {
+                let var_info = VariableInfo {
+                    name: var_name.clone(),
+                    variable_type: VariableType::Node,
+                    labels: node.labels.clone(),
+                    properties: node.properties.keys().cloned().collect(),
+                    defined_in: self.current_scope.clone(),
+                };
+                self.variables.insert(var_name.clone(), var_info);
             }
-
-            self.variables.insert(var_name.clone(), var_info);
         }
         Ok(())
     }
@@ -181,25 +188,31 @@ impl SemanticAnalyzer {
         var_name: &str,
         rel: &RelationshipPattern,
     ) -> Result<()> {
-        let var_info = VariableInfo {
-            name: var_name.to_string(),
-            variable_type: VariableType::Relationship,
-            labels: rel.types.clone(), // Relationship types are like labels
-            properties: rel.properties.keys().cloned().collect(),
-            defined_in: self.current_scope.clone(),
-        };
-
-        if self.variables.contains_key(var_name) {
-            let existing = &self.variables[var_name];
+        if let Some(existing) = self.variables.get_mut(var_name) {
             if existing.variable_type != VariableType::Relationship {
                 return Err(GraphError::PlanError {
                     message: format!("Variable '{}' redefined with different type", var_name),
                     location: snafu::Location::new(file!(), line!(), column!()),
                 });
             }
+            for rel_type in &rel.types {
+                if !existing.labels.contains(rel_type) {
+                    existing.labels.push(rel_type.clone());
+                }
+            }
+            for prop in rel.properties.keys() {
+                existing.properties.insert(prop.clone());
+            }
+        } else {
+            let var_info = VariableInfo {
+                name: var_name.to_string(),
+                variable_type: VariableType::Relationship,
+                labels: rel.types.clone(), // Relationship types are like labels
+                properties: rel.properties.keys().cloned().collect(),
+                defined_in: self.current_scope.clone(),
+            };
+            self.variables.insert(var_name.to_string(), var_info);
         }
-
-        self.variables.insert(var_name.to_string(), var_info);
         Ok(())
     }
 
@@ -325,19 +338,417 @@ impl SemanticAnalyzer {
         // - Check that comparison operations are valid for data types
         // - Check that arithmetic operations are valid
 
-        // For now, just check that variables are properly scoped
+        // Check that properties referenced in patterns exist in schema when property fields are defined
         for var_info in self.variables.values() {
-            if var_info.defined_in == ScopeType::Return
-                && !self
-                    .variables
-                    .values()
-                    .any(|v| v.name == var_info.name && v.defined_in == ScopeType::Match)
-            {
-                errors.push(format!(
-                    "Variable '{}' used in RETURN but not defined in MATCH",
-                    var_info.name
-                ));
+            match var_info.variable_type {
+                VariableType::Node => {
+                    // Collect property_fields from all known label mappings that specify properties
+                    let mut label_property_sets: Vec<&[String]> = Vec::new();
+                    for label in &var_info.labels {
+                        if let Some(mapping) = self.config.get_node_mapping(label) {
+                            if !mapping.property_fields.is_empty() {
+                                label_property_sets.push(&mapping.property_fields);
+                            }
+                        }
+                    }
+
+                    if !label_property_sets.is_empty() {
+                        'prop: for prop in &var_info.properties {
+                            // Property is valid if present in at least one label's property_fields
+                            for fields in &label_property_sets {
+                                if fields.iter().any(|f| f == prop) {
+                                    continue 'prop;
+                                }
+                            }
+                            errors.push(format!(
+                                "Property '{}' not found on labels {:?}",
+                                prop, var_info.labels
+                            ));
+                        }
+                    }
+                }
+                VariableType::Relationship => {
+                    // Collect property_fields from all known relationship mappings that specify properties
+                    let mut rel_property_sets: Vec<&[String]> = Vec::new();
+                    for rel_type in &var_info.labels {
+                        if let Some(mapping) = self.config.get_relationship_mapping(rel_type) {
+                            if !mapping.property_fields.is_empty() {
+                                rel_property_sets.push(&mapping.property_fields);
+                            }
+                        }
+                    }
+
+                    if !rel_property_sets.is_empty() {
+                        'prop_rel: for prop in &var_info.properties {
+                            for fields in &rel_property_sets {
+                                if fields.iter().any(|f| f == prop) {
+                                    continue 'prop_rel;
+                                }
+                            }
+                            errors.push(format!(
+                                "Property '{}' not found on relationship types {:?}",
+                                prop, var_info.labels
+                            ));
+                        }
+                    }
+                }
+                _ => {}
             }
         }
+    }
+}
+
+impl SemanticAnalyzer {
+    fn validate_length_range(&self, rel: &RelationshipPattern) -> Result<()> {
+        if let Some(len) = &rel.length {
+            if let (Some(min), Some(max)) = (len.min, len.max) {
+                if min > max {
+                    return Err(GraphError::PlanError {
+                        message: "Invalid path length range: min > max".to_string(),
+                        location: snafu::Location::new(file!(), line!(), column!()),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ast::{
+        BooleanExpression, CypherQuery, GraphPattern, LengthRange, MatchClause, NodePattern,
+        PathPattern, PathSegment, PropertyRef, PropertyValue, RelationshipDirection,
+        RelationshipPattern, ReturnClause, WhereClause,
+    };
+    use crate::config::{GraphConfig, NodeMapping};
+
+    fn test_config() -> GraphConfig {
+        GraphConfig::builder()
+            .with_node_label("Person", "id")
+            .with_node_label("Employee", "id")
+            .with_node_label("Company", "id")
+            .with_relationship("KNOWS", "src_id", "dst_id")
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_merge_node_variable_metadata() {
+        // MATCH (n:Person {age: 30}), (n:Employee {dept: "X"})
+        let node1 = NodePattern::new(Some("n".to_string()))
+            .with_label("Person")
+            .with_property("age", PropertyValue::Integer(30));
+        let node2 = NodePattern::new(Some("n".to_string()))
+            .with_label("Employee")
+            .with_property("dept", PropertyValue::String("X".to_string()));
+
+        let query = CypherQuery {
+            match_clauses: vec![MatchClause {
+                patterns: vec![GraphPattern::Node(node1), GraphPattern::Node(node2)],
+            }],
+            where_clause: None,
+            return_clause: ReturnClause {
+                distinct: false,
+                items: vec![],
+            },
+            limit: None,
+            order_by: None,
+            skip: None,
+        };
+
+        let mut analyzer = SemanticAnalyzer::new(test_config());
+        let result = analyzer.analyze(&query).unwrap();
+        assert!(result.errors.is_empty());
+        let n = result.variables.get("n").expect("variable n present");
+        // Labels merged
+        assert!(n.labels.contains(&"Person".to_string()));
+        assert!(n.labels.contains(&"Employee".to_string()));
+        // Properties unioned
+        assert!(n.properties.contains("age"));
+        assert!(n.properties.contains("dept"));
+    }
+
+    #[test]
+    fn test_invalid_length_range_collects_error() {
+        let start = NodePattern::new(Some("a".to_string())).with_label("Person");
+        let end = NodePattern::new(Some("b".to_string())).with_label("Person");
+        let mut rel = RelationshipPattern::new(RelationshipDirection::Outgoing)
+            .with_variable("r")
+            .with_type("KNOWS");
+        rel.length = Some(LengthRange {
+            min: Some(3),
+            max: Some(2),
+        });
+
+        let path = PathPattern {
+            start_node: start,
+            segments: vec![PathSegment {
+                relationship: rel,
+                end_node: end,
+            }],
+        };
+
+        let query = CypherQuery {
+            match_clauses: vec![MatchClause {
+                patterns: vec![GraphPattern::Path(path)],
+            }],
+            where_clause: None,
+            return_clause: ReturnClause {
+                distinct: false,
+                items: vec![],
+            },
+            limit: None,
+            order_by: None,
+            skip: None,
+        };
+
+        let mut analyzer = SemanticAnalyzer::new(test_config());
+        let result = analyzer.analyze(&query).unwrap();
+        assert!(result
+            .errors
+            .iter()
+            .any(|e| e.contains("Invalid path length range")));
+    }
+
+    #[test]
+    fn test_undefined_variable_in_where() {
+        // MATCH (n:Person) WHERE EXISTS(m.name)
+        let node = NodePattern::new(Some("n".to_string())).with_label("Person");
+        let where_clause = WhereClause {
+            expression: BooleanExpression::Exists(PropertyRef::new("m", "name")),
+        };
+        let query = CypherQuery {
+            match_clauses: vec![MatchClause {
+                patterns: vec![GraphPattern::Node(node)],
+            }],
+            where_clause: Some(where_clause),
+            return_clause: ReturnClause {
+                distinct: false,
+                items: vec![],
+            },
+            limit: None,
+            order_by: None,
+            skip: None,
+        };
+
+        let mut analyzer = SemanticAnalyzer::new(test_config());
+        let result = analyzer.analyze(&query).unwrap();
+        assert!(result
+            .errors
+            .iter()
+            .any(|e| e.contains("Undefined variable: 'm'")));
+    }
+
+    #[test]
+    fn test_variable_redefinition_between_node_and_relationship() {
+        // MATCH (n:Person)-[n:KNOWS]->(m:Person)
+        let start = NodePattern::new(Some("n".to_string())).with_label("Person");
+        let end = NodePattern::new(Some("m".to_string())).with_label("Person");
+        let rel = RelationshipPattern::new(RelationshipDirection::Outgoing)
+            .with_variable("n")
+            .with_type("KNOWS");
+
+        let path = PathPattern {
+            start_node: start,
+            segments: vec![PathSegment {
+                relationship: rel,
+                end_node: end,
+            }],
+        };
+
+        let query = CypherQuery {
+            match_clauses: vec![MatchClause {
+                patterns: vec![GraphPattern::Path(path)],
+            }],
+            where_clause: None,
+            return_clause: ReturnClause {
+                distinct: false,
+                items: vec![],
+            },
+            limit: None,
+            order_by: None,
+            skip: None,
+        };
+
+        let mut analyzer = SemanticAnalyzer::new(test_config());
+        let result = analyzer.analyze(&query).unwrap();
+        assert!(result
+            .errors
+            .iter()
+            .any(|e| e.contains("redefined with different type")));
+    }
+
+    #[test]
+    fn test_unknown_node_label_warns() {
+        // MATCH (x:Unknown)
+        let node = NodePattern::new(Some("x".to_string())).with_label("Unknown");
+        let query = CypherQuery {
+            match_clauses: vec![MatchClause {
+                patterns: vec![GraphPattern::Node(node)],
+            }],
+            where_clause: None,
+            return_clause: ReturnClause {
+                distinct: false,
+                items: vec![],
+            },
+            limit: None,
+            order_by: None,
+            skip: None,
+        };
+
+        let mut analyzer = SemanticAnalyzer::new(test_config());
+        let result = analyzer.analyze(&query).unwrap();
+        assert!(result
+            .warnings
+            .iter()
+            .any(|w| w.contains("Node label 'Unknown' not found in schema")));
+    }
+
+    #[test]
+    fn test_property_not_in_schema_reports_error() {
+        // Configure Person with allowed property 'name' only
+        let custom_config = GraphConfig::builder()
+            .with_node_mapping(
+                NodeMapping::new("Person", "id").with_properties(vec!["name".to_string()]),
+            )
+            .with_relationship("KNOWS", "src_id", "dst_id")
+            .build()
+            .unwrap();
+
+        // MATCH (n:Person {age: 30})
+        let node = NodePattern::new(Some("n".to_string()))
+            .with_label("Person")
+            .with_property("age", PropertyValue::Integer(30));
+        let query = CypherQuery {
+            match_clauses: vec![MatchClause {
+                patterns: vec![GraphPattern::Node(node)],
+            }],
+            where_clause: None,
+            return_clause: ReturnClause {
+                distinct: false,
+                items: vec![],
+            },
+            limit: None,
+            order_by: None,
+            skip: None,
+        };
+
+        let mut analyzer = SemanticAnalyzer::new(custom_config);
+        let result = analyzer.analyze(&query).unwrap();
+        assert!(result
+            .errors
+            .iter()
+            .any(|e| e.contains("Property 'age' not found on labels [\"Person\"]")));
+    }
+
+    #[test]
+    fn test_valid_length_range_ok() {
+        let start = NodePattern::new(Some("a".to_string())).with_label("Person");
+        let end = NodePattern::new(Some("b".to_string())).with_label("Person");
+        let mut rel = RelationshipPattern::new(RelationshipDirection::Outgoing)
+            .with_variable("r")
+            .with_type("KNOWS");
+        rel.length = Some(LengthRange {
+            min: Some(2),
+            max: Some(3),
+        });
+
+        let path = PathPattern {
+            start_node: start,
+            segments: vec![PathSegment {
+                relationship: rel,
+                end_node: end,
+            }],
+        };
+
+        let query = CypherQuery {
+            match_clauses: vec![MatchClause {
+                patterns: vec![GraphPattern::Path(path)],
+            }],
+            where_clause: None,
+            return_clause: ReturnClause {
+                distinct: false,
+                items: vec![],
+            },
+            limit: None,
+            order_by: None,
+            skip: None,
+        };
+
+        let mut analyzer = SemanticAnalyzer::new(test_config());
+        let result = analyzer.analyze(&query).unwrap();
+        assert!(result
+            .errors
+            .iter()
+            .all(|e| !e.contains("Invalid path length range")));
+    }
+
+    #[test]
+    fn test_relationship_variable_metadata_merge_across_segments() {
+        // Path with two segments sharing the same relationship variable 'r'
+        // (a:Person)-[r:KNOWS {since: 2020}]->(b:Person)-[r:FRIEND {level: 1}]->(c:Person)
+        let start = NodePattern::new(Some("a".to_string())).with_label("Person");
+        let mid = NodePattern::new(Some("b".to_string())).with_label("Person");
+        let end = NodePattern::new(Some("c".to_string())).with_label("Person");
+
+        let mut rel1 = RelationshipPattern::new(RelationshipDirection::Outgoing)
+            .with_variable("r")
+            .with_type("KNOWS")
+            .with_property("since", PropertyValue::Integer(2020));
+        rel1.length = None;
+
+        let mut rel2 = RelationshipPattern::new(RelationshipDirection::Outgoing)
+            .with_variable("r")
+            .with_type("FRIEND")
+            .with_property("level", PropertyValue::Integer(1));
+        rel2.length = None;
+
+        let path = PathPattern {
+            start_node: start,
+            segments: vec![
+                PathSegment {
+                    relationship: rel1,
+                    end_node: mid,
+                },
+                PathSegment {
+                    relationship: rel2,
+                    end_node: end,
+                },
+            ],
+        };
+
+        // Custom config that knows both relationship types to avoid warnings muddying the assertion
+        let custom_config = GraphConfig::builder()
+            .with_node_label("Person", "id")
+            .with_relationship("KNOWS", "src_id", "dst_id")
+            .with_relationship("FRIEND", "src_id", "dst_id")
+            .build()
+            .unwrap();
+
+        let query = CypherQuery {
+            match_clauses: vec![MatchClause {
+                patterns: vec![GraphPattern::Path(path)],
+            }],
+            where_clause: None,
+            return_clause: ReturnClause {
+                distinct: false,
+                items: vec![],
+            },
+            limit: None,
+            order_by: None,
+            skip: None,
+        };
+
+        let mut analyzer = SemanticAnalyzer::new(custom_config);
+        let result = analyzer.analyze(&query).unwrap();
+        let r = result.variables.get("r").expect("variable r present");
+        // Types merged
+        assert!(r.labels.contains(&"KNOWS".to_string()));
+        assert!(r.labels.contains(&"FRIEND".to_string()));
+        // Properties unioned
+        assert!(r.properties.contains("since"));
+        assert!(r.properties.contains("level"));
     }
 }
