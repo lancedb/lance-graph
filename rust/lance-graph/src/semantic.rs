@@ -268,11 +268,14 @@ impl SemanticAnalyzer {
                     });
                 }
             }
-            ValueExpression::Function { .. } => {
-                // TODO: Implement function validation
+            ValueExpression::Function { args, .. } => {
+                for arg in args {
+                    self.analyze_value_expression(arg)?;
+                }
             }
-            ValueExpression::Arithmetic { .. } => {
-                // TODO: Implement arithmetic validation
+            ValueExpression::Arithmetic { left, right, .. } => {
+                self.analyze_value_expression(left)?;
+                self.analyze_value_expression(right)?;
             }
         }
         Ok(())
@@ -418,9 +421,9 @@ impl SemanticAnalyzer {
 mod tests {
     use super::*;
     use crate::ast::{
-        BooleanExpression, CypherQuery, GraphPattern, LengthRange, MatchClause, NodePattern,
-        PathPattern, PathSegment, PropertyRef, PropertyValue, RelationshipDirection,
-        RelationshipPattern, ReturnClause, WhereClause,
+        ArithmeticOperator, BooleanExpression, CypherQuery, GraphPattern, LengthRange, MatchClause,
+        NodePattern, PathPattern, PathSegment, PropertyRef, PropertyValue, RelationshipDirection,
+        RelationshipPattern, ReturnClause, ReturnItem, ValueExpression, WhereClause,
     };
     use crate::config::{GraphConfig, NodeMapping};
 
@@ -750,5 +753,130 @@ mod tests {
         // Properties unioned
         assert!(r.properties.contains("since"));
         assert!(r.properties.contains("level"));
+    }
+
+    #[test]
+    fn test_function_argument_undefined_variable_in_return() {
+        // MATCH (n:Person) RETURN toUpper(m.name)
+        let node = NodePattern::new(Some("n".to_string())).with_label("Person");
+        let query = CypherQuery {
+            match_clauses: vec![MatchClause {
+                patterns: vec![GraphPattern::Node(node)],
+            }],
+            where_clause: None,
+            return_clause: ReturnClause {
+                distinct: false,
+                items: vec![ReturnItem {
+                    expression: ValueExpression::Function {
+                        name: "toUpper".to_string(),
+                        args: vec![ValueExpression::Property(PropertyRef::new("m", "name"))],
+                    },
+                    alias: None,
+                }],
+            },
+            limit: None,
+            order_by: None,
+            skip: None,
+        };
+
+        let mut analyzer = SemanticAnalyzer::new(test_config());
+        let result = analyzer.analyze(&query).unwrap();
+        assert!(result
+            .errors
+            .iter()
+            .any(|e| e.contains("Undefined variable: 'm'")));
+    }
+
+    #[test]
+    fn test_function_argument_valid_variable_ok() {
+        // MATCH (n:Person) RETURN toUpper(n.name)
+        let node = NodePattern::new(Some("n".to_string())).with_label("Person");
+        let query = CypherQuery {
+            match_clauses: vec![MatchClause {
+                patterns: vec![GraphPattern::Node(node)],
+            }],
+            where_clause: None,
+            return_clause: ReturnClause {
+                distinct: false,
+                items: vec![ReturnItem {
+                    expression: ValueExpression::Function {
+                        name: "toUpper".to_string(),
+                        args: vec![ValueExpression::Property(PropertyRef::new("n", "name"))],
+                    },
+                    alias: None,
+                }],
+            },
+            limit: None,
+            order_by: None,
+            skip: None,
+        };
+
+        let mut analyzer = SemanticAnalyzer::new(test_config());
+        let result = analyzer.analyze(&query).unwrap();
+        assert!(result.errors.is_empty());
+    }
+
+    #[test]
+    fn test_arithmetic_with_undefined_variable_in_return() {
+        // RETURN x + 1
+        let query = CypherQuery {
+            match_clauses: vec![],
+            where_clause: None,
+            return_clause: ReturnClause {
+                distinct: false,
+                items: vec![ReturnItem {
+                    expression: ValueExpression::Arithmetic {
+                        left: Box::new(ValueExpression::Variable("x".to_string())),
+                        operator: ArithmeticOperator::Add,
+                        right: Box::new(ValueExpression::Literal(PropertyValue::Integer(1))),
+                    },
+                    alias: None,
+                }],
+            },
+            limit: None,
+            order_by: None,
+            skip: None,
+        };
+
+        let mut analyzer = SemanticAnalyzer::new(test_config());
+        let result = analyzer.analyze(&query).unwrap();
+        assert!(result
+            .errors
+            .iter()
+            .any(|e| e.contains("Undefined variable: 'x'")));
+    }
+
+    #[test]
+    fn test_arithmetic_with_defined_property_ok() {
+        // MATCH (n:Person) RETURN 1 + n.age
+        let node = NodePattern::new(Some("n".to_string())).with_label("Person");
+        let query = CypherQuery {
+            match_clauses: vec![MatchClause {
+                patterns: vec![GraphPattern::Node(node)],
+            }],
+            where_clause: None,
+            return_clause: ReturnClause {
+                distinct: false,
+                items: vec![ReturnItem {
+                    expression: ValueExpression::Arithmetic {
+                        left: Box::new(ValueExpression::Literal(PropertyValue::Integer(1))),
+                        operator: ArithmeticOperator::Add,
+                        right: Box::new(ValueExpression::Property(PropertyRef::new("n", "age"))),
+                    },
+                    alias: None,
+                }],
+            },
+            limit: None,
+            order_by: None,
+            skip: None,
+        };
+
+        let mut analyzer = SemanticAnalyzer::new(test_config());
+        let result = analyzer.analyze(&query).unwrap();
+        // Should not report undefined variable 'n'
+        assert!(result
+            .errors
+            .iter()
+            .all(|e| !e.contains("Undefined variable: 'n'")));
     }
 }
