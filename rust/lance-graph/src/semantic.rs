@@ -861,9 +861,7 @@ mod tests {
                     expression: ValueExpression::Arithmetic {
                         left: Box::new(ValueExpression::Literal(PropertyValue::Integer(1))),
                         operator: ArithmeticOperator::Add,
-                        right: Box::new(ValueExpression::Property(PropertyRef::new(
-                            "n", "age",
-                        ))),
+                        right: Box::new(ValueExpression::Property(PropertyRef::new("n", "age"))),
                     },
                     alias: None,
                 }],
