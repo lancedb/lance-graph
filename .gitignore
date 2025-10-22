@@ -34,6 +34,8 @@ venv/
 env/
 python/.venv/
 .python-version
+llm_config.yaml
+python/knowledge_graph_data/
 
 # IDE & tooling
 .vscode/

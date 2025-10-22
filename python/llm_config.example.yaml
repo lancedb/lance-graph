@@ -1,0 +1,10 @@
+# Example LLM client configuration (public-safe template)
+# Copy this file to llm_config.yaml and fill in your values.
+api_key: YOUR_API_KEY_HERE
+# Optional: override base URL for self-hosted or compatible APIs (e.g., OpenAI-compatible gateways)
+base_url: https://api.openai.com/v1
+# Optional: additional HTTP headers to send with each request
+default_headers:
+  # openai-organization: YOUR_ORG_ID
+  # Authorization is derived from api_key by the client; do not duplicate here
+  # Custom-Header: value
