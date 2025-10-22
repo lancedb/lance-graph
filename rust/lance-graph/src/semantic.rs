@@ -279,9 +279,8 @@ impl SemanticAnalyzer {
                 self.analyze_value_expression(right)?;
 
                 // If both sides are literals, ensure they are numeric
-                let is_numeric_literal = |pv: &PropertyValue| match pv {
-                    PropertyValue::Integer(_) | PropertyValue::Float(_) => true,
-                    _ => false,
+                let is_numeric_literal = |pv: &PropertyValue| {
+                    matches!(pv, PropertyValue::Integer(_) | PropertyValue::Float(_))
                 };
 
                 if let (ValueExpression::Literal(l1), ValueExpression::Literal(l2)) =
