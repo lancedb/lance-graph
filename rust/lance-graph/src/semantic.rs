@@ -274,8 +274,25 @@ impl SemanticAnalyzer {
                 }
             }
             ValueExpression::Arithmetic { left, right, .. } => {
+                // Validate arithmetic operands recursively
                 self.analyze_value_expression(left)?;
                 self.analyze_value_expression(right)?;
+
+                // If both sides are literals, ensure they are numeric
+                let is_numeric_literal = |pv: &PropertyValue| {
+                    matches!(pv, PropertyValue::Integer(_) | PropertyValue::Float(_))
+                };
+
+                if let (ValueExpression::Literal(l1), ValueExpression::Literal(l2)) =
+                    (&**left, &**right)
+                {
+                    if !(is_numeric_literal(l1) && is_numeric_literal(l2)) {
+                        return Err(GraphError::PlanError {
+                            message: "Arithmetic requires numeric literal operands".to_string(),
+                            location: snafu::Location::new(file!(), line!(), column!()),
+                        });
+                    }
+                }
             }
         }
         Ok(())
@@ -435,6 +452,53 @@ mod tests {
             .with_relationship("KNOWS", "src_id", "dst_id")
             .build()
             .unwrap()
+    }
+
+    // Helper: analyze a query that only has a single RETURN expression
+    fn analyze_return_expr(expr: ValueExpression) -> Result<SemanticResult> {
+        let query = CypherQuery {
+            match_clauses: vec![],
+            where_clause: None,
+            return_clause: ReturnClause {
+                distinct: false,
+                items: vec![ReturnItem {
+                    expression: expr,
+                    alias: None,
+                }],
+            },
+            limit: None,
+            order_by: None,
+            skip: None,
+        };
+        let mut analyzer = SemanticAnalyzer::new(test_config());
+        analyzer.analyze(&query)
+    }
+
+    // Helper: analyze a query with a single MATCH (var:label) and a RETURN expression
+    fn analyze_return_with_match(
+        var: &str,
+        label: &str,
+        expr: ValueExpression,
+    ) -> Result<SemanticResult> {
+        let node = NodePattern::new(Some(var.to_string())).with_label(label);
+        let query = CypherQuery {
+            match_clauses: vec![MatchClause {
+                patterns: vec![GraphPattern::Node(node)],
+            }],
+            where_clause: None,
+            return_clause: ReturnClause {
+                distinct: false,
+                items: vec![ReturnItem {
+                    expression: expr,
+                    alias: None,
+                }],
+            },
+            limit: None,
+            order_by: None,
+            skip: None,
+        };
+        let mut analyzer = SemanticAnalyzer::new(test_config());
+        analyzer.analyze(&query)
     }
 
     #[test]
@@ -757,30 +821,12 @@ mod tests {
 
     #[test]
     fn test_function_argument_undefined_variable_in_return() {
-        // MATCH (n:Person) RETURN toUpper(m.name)
-        let node = NodePattern::new(Some("n".to_string())).with_label("Person");
-        let query = CypherQuery {
-            match_clauses: vec![MatchClause {
-                patterns: vec![GraphPattern::Node(node)],
-            }],
-            where_clause: None,
-            return_clause: ReturnClause {
-                distinct: false,
-                items: vec![ReturnItem {
-                    expression: ValueExpression::Function {
-                        name: "toUpper".to_string(),
-                        args: vec![ValueExpression::Property(PropertyRef::new("m", "name"))],
-                    },
-                    alias: None,
-                }],
-            },
-            limit: None,
-            order_by: None,
-            skip: None,
+        // RETURN toUpper(m.name)
+        let expr = ValueExpression::Function {
+            name: "toUpper".to_string(),
+            args: vec![ValueExpression::Property(PropertyRef::new("m", "name"))],
         };
-
-        let mut analyzer = SemanticAnalyzer::new(test_config());
-        let result = analyzer.analyze(&query).unwrap();
+        let result = analyze_return_expr(expr).unwrap();
         assert!(result
             .errors
             .iter()
@@ -790,56 +836,23 @@ mod tests {
     #[test]
     fn test_function_argument_valid_variable_ok() {
         // MATCH (n:Person) RETURN toUpper(n.name)
-        let node = NodePattern::new(Some("n".to_string())).with_label("Person");
-        let query = CypherQuery {
-            match_clauses: vec![MatchClause {
-                patterns: vec![GraphPattern::Node(node)],
-            }],
-            where_clause: None,
-            return_clause: ReturnClause {
-                distinct: false,
-                items: vec![ReturnItem {
-                    expression: ValueExpression::Function {
-                        name: "toUpper".to_string(),
-                        args: vec![ValueExpression::Property(PropertyRef::new("n", "name"))],
-                    },
-                    alias: None,
-                }],
-            },
-            limit: None,
-            order_by: None,
-            skip: None,
+        let expr = ValueExpression::Function {
+            name: "toUpper".to_string(),
+            args: vec![ValueExpression::Property(PropertyRef::new("n", "name"))],
         };
-
-        let mut analyzer = SemanticAnalyzer::new(test_config());
-        let result = analyzer.analyze(&query).unwrap();
+        let result = analyze_return_with_match("n", "Person", expr).unwrap();
         assert!(result.errors.is_empty());
     }
 
     #[test]
     fn test_arithmetic_with_undefined_variable_in_return() {
         // RETURN x + 1
-        let query = CypherQuery {
-            match_clauses: vec![],
-            where_clause: None,
-            return_clause: ReturnClause {
-                distinct: false,
-                items: vec![ReturnItem {
-                    expression: ValueExpression::Arithmetic {
-                        left: Box::new(ValueExpression::Variable("x".to_string())),
-                        operator: ArithmeticOperator::Add,
-                        right: Box::new(ValueExpression::Literal(PropertyValue::Integer(1))),
-                    },
-                    alias: None,
-                }],
-            },
-            limit: None,
-            order_by: None,
-            skip: None,
+        let expr = ValueExpression::Arithmetic {
+            left: Box::new(ValueExpression::Variable("x".to_string())),
+            operator: ArithmeticOperator::Add,
+            right: Box::new(ValueExpression::Literal(PropertyValue::Integer(1))),
         };
-
-        let mut analyzer = SemanticAnalyzer::new(test_config());
-        let result = analyzer.analyze(&query).unwrap();
+        let result = analyze_return_expr(expr).unwrap();
         assert!(result
             .errors
             .iter()
@@ -848,35 +861,47 @@ mod tests {
 
     #[test]
     fn test_arithmetic_with_defined_property_ok() {
-        // MATCH (n:Person) RETURN 1 + n.age
-        let node = NodePattern::new(Some("n".to_string())).with_label("Person");
-        let query = CypherQuery {
-            match_clauses: vec![MatchClause {
-                patterns: vec![GraphPattern::Node(node)],
-            }],
-            where_clause: None,
-            return_clause: ReturnClause {
-                distinct: false,
-                items: vec![ReturnItem {
-                    expression: ValueExpression::Arithmetic {
-                        left: Box::new(ValueExpression::Literal(PropertyValue::Integer(1))),
-                        operator: ArithmeticOperator::Add,
-                        right: Box::new(ValueExpression::Property(PropertyRef::new("n", "age"))),
-                    },
-                    alias: None,
-                }],
-            },
-            limit: None,
-            order_by: None,
-            skip: None,
+        let expr = ValueExpression::Arithmetic {
+            left: Box::new(ValueExpression::Literal(PropertyValue::Integer(1))),
+            operator: ArithmeticOperator::Add,
+            right: Box::new(ValueExpression::Property(PropertyRef::new("n", "age"))),
         };
-
-        let mut analyzer = SemanticAnalyzer::new(test_config());
-        let result = analyzer.analyze(&query).unwrap();
+        let result = analyze_return_with_match("n", "Person", expr).unwrap();
         // Should not report undefined variable 'n'
         assert!(result
             .errors
             .iter()
             .all(|e| !e.contains("Undefined variable: 'n'")));
+    }
+
+    #[test]
+    fn test_arithmetic_with_non_numeric_literal_error() {
+        // RETURN "x" + 1
+        let expr = ValueExpression::Arithmetic {
+            left: Box::new(ValueExpression::Literal(PropertyValue::String(
+                "x".to_string(),
+            ))),
+            operator: ArithmeticOperator::Add,
+            right: Box::new(ValueExpression::Literal(PropertyValue::Integer(1))),
+        };
+        let result = analyze_return_expr(expr).unwrap();
+        // The semantic analyzer returns Ok with errors collected in the result
+        assert!(result
+            .errors
+            .iter()
+            .any(|e| e.contains("Arithmetic requires numeric literal operands")));
+    }
+
+    #[test]
+    fn test_arithmetic_with_numeric_literals_ok() {
+        // RETURN 1 + 2.0
+        let expr = ValueExpression::Arithmetic {
+            left: Box::new(ValueExpression::Literal(PropertyValue::Integer(1))),
+            operator: ArithmeticOperator::Add,
+            right: Box::new(ValueExpression::Literal(PropertyValue::Float(2.0))),
+        };
+        let result = analyze_return_expr(expr);
+        assert!(result.is_ok(), "Expected Ok but got {:?}", result);
+        assert!(result.unwrap().errors.is_empty());
     }
 }
