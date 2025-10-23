@@ -43,6 +43,14 @@ maturin develop
 
 - `python/src/` – PyO3 bridge that exposes graph APIs to Python
 - `python/python/lance_graph/` – pure-Python wrapper and `__init__`
+- `python/python/knowledge_graph/` – CLI, FastAPI, and extractor utilities built on Lance
 - `python/python/tests/` – graph-centric functional tests
 
 Refer to the repository root `README.md` for information about the Rust crate.
+
+> Run CLI commands through `uv run knowledge_graph ...`. The default uses an
+> LLM-backed extractor; install the LLM extra with `uv sync --extra llm` (or
+> `uv pip install -e '.[llm]'`) and configure `OPENAI_API_KEY`. Install
+> `uv sync --extra lance-storage` to enable Lance dataset persistence. Supply
+> extra options (e.g., `base_url`, HTTP headers) via `--llm-config`. Use
+> `--extractor heuristic` to avoid LLM calls during testing or offline work.

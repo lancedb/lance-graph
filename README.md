@@ -5,7 +5,9 @@ Lance Graph is a Cypher-capable graph query engine built in Rust with Python bin
 This repository contains:
 
 - `rust/lance-graph` – the Cypher-capable query engine implemented in Rust
-- `python/` – PyO3 bindings and a thin `lance_graph` Python package
+- `python/` – PyO3 bindings and Python packages:
+  - `lance_graph` – thin wrapper around the Rust query engine
+  - `knowledge_graph` – Lance-backed knowledge graph CLI, API, and utilities
 
 ## Prerequisites
 
@@ -61,6 +63,65 @@ query = (
 result = query.execute({"Person": people})
 print(result.to_pydict())  # {'name': ['Bob', 'David'], 'age': [34, 42]}
 ```
+
+## Knowledge Graph CLI & API
+
+The `knowledge_graph` package layers a simple Lance-backed knowledge graph
+service on top of the `lance_graph` engine. It provides:
+
+- A CLI (`knowledge_graph.main`) for initializing storage, running Cypher
+  queries, and bootstrapping data via heuristic text extraction.
+- A reusable FastAPI component, plus a standalone web service
+  (`knowledge_graph.webservice`) that exposes query and dataset endpoints.
+- Storage helpers that persist node and relationship tables as Lance datasets.
+
+### CLI usage
+
+```bash
+uv run knowledge_graph --init                    # initialize storage and schema stub
+uv run knowledge_graph --list-datasets           # list Lance datasets on disk
+uv run knowledge_graph --extract-preview notes.txt
+uv run knowledge_graph --extract-preview "Alice joined the graph team"
+uv run knowledge_graph --extract-and-add notes.txt
+uv run knowledge_graph "MATCH (n) RETURN n LIMIT 5"
+uv run knowledge_graph --log-level DEBUG --extract-preview "Inline text"
+uv run knowledge_graph --ask "Who is working on the Presto project?"
+
+
+# Configure LLM extraction (default)
+uv sync --extra llm  # install optional LLM dependencies
+uv sync --extra lance-storage  # install Lance dataset support
+export OPENAI_API_KEY=sk-...
+uv run knowledge_graph --llm-model gpt-4o-mini --extract-preview notes.txt
+
+# Supply additional OpenAI client options via YAML (base_url, headers, etc.)
+uv run knowledge_graph --llm-config llm_config.yaml --extract-and-add notes.txt
+
+# Fall back to the heuristic extractor when LLM access is unavailable
+uv run knowledge_graph --extractor heuristic --extract-preview notes.txt
+
+```
+
+The default extractor uses OpenAI. Configure credentials via environment
+variables supported by the SDK (for example `OPENAI_API_BASE` or
+`OPENAI_API_KEY`), or place them in a YAML file passed through `--llm-config`.
+Override the model and temperature with `--llm-model` and `--llm-temperature`.
+```
+
+By default the CLI writes datasets under `./knowledge_graph_data`. Provide
+`--root` and `--schema` to point at alternate storage locations and schema YAML.
+
+### FastAPI service
+
+Run the web service after installing the `knowledge_graph` package (and
+dependencies such as FastAPI):
+
+```bash
+uv run --package knowledge_graph knowledge_graph-webservice
+```
+
+The service exposes endpoints under `/graph`, including `/graph/health`,
+`/graph/query`, `/graph/datasets`, and `/graph/schema`.
 
 ### Development workflow
 

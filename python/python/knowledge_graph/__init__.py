@@ -13,6 +13,19 @@ try:  # Prefer to import for typing without raising at runtime.
 except ImportError:  # pragma: no cover - builder is available in normal installs.
     GraphConfigBuilder = object  # type: ignore[assignment]
 
+from .component import KnowledgeGraphComponent
+from .config import KnowledgeGraphConfig, build_graph_config_from_mapping
+from .extraction import (
+    DEFAULT_STRATEGY,
+    BaseExtractor,
+    get_extractor,
+    preview_extraction,
+)
+from .extractors import HeuristicExtractor, LLMExtractor
+from .service import LanceKnowledgeGraph, create_default_service
+from .store import LanceGraphStore
+from .webservice import create_app
+
 TableMapping = Mapping[str, pa.Table]
 
 
@@ -100,4 +113,20 @@ class KnowledgeGraphBuilder:
         return KnowledgeGraph(config, self._datasets)
 
 
-__all__ = ["KnowledgeGraph", "KnowledgeGraphBuilder"]
+__all__ = [
+    "KnowledgeGraph",
+    "KnowledgeGraphBuilder",
+    "KnowledgeGraphConfig",
+    "build_graph_config_from_mapping",
+    "LanceGraphStore",
+    "LanceKnowledgeGraph",
+    "create_default_service",
+    "KnowledgeGraphComponent",
+    "create_app",
+    "DEFAULT_STRATEGY",
+    "BaseExtractor",
+    "get_extractor",
+    "preview_extraction",
+    "HeuristicExtractor",
+    "LLMExtractor",
+]

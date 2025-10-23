@@ -254,9 +254,66 @@ fn where_clause(input: &str) -> IResult<&str, WhereClause> {
     Ok((input, WhereClause { expression }))
 }
 
-// Parse a boolean expression (simplified)
+// Parse a boolean expression with OR precedence
 fn boolean_expression(input: &str) -> IResult<&str, BooleanExpression> {
-    // For now, just parse simple comparisons
+    boolean_or_expression(input)
+}
+
+fn boolean_or_expression(input: &str) -> IResult<&str, BooleanExpression> {
+    let (input, first) = boolean_and_expression(input)?;
+    let (input, rest) = many0(preceded(
+        tuple((multispace0, tag_no_case("OR"), multispace1)),
+        boolean_and_expression,
+    ))(input)?;
+    let expr = rest.into_iter().fold(first, |acc, item| {
+        BooleanExpression::Or(Box::new(acc), Box::new(item))
+    });
+    Ok((input, expr))
+}
+
+fn boolean_and_expression(input: &str) -> IResult<&str, BooleanExpression> {
+    let (input, first) = boolean_not_expression(input)?;
+    let (input, rest) = many0(preceded(
+        tuple((multispace0, tag_no_case("AND"), multispace1)),
+        boolean_not_expression,
+    ))(input)?;
+    let expr = rest.into_iter().fold(first, |acc, item| {
+        BooleanExpression::And(Box::new(acc), Box::new(item))
+    });
+    Ok((input, expr))
+}
+
+fn boolean_not_expression(input: &str) -> IResult<&str, BooleanExpression> {
+    let (input, _) = multispace0(input)?;
+    alt((
+        map(
+            preceded(
+                tuple((tag_no_case("NOT"), multispace1)),
+                boolean_not_expression,
+            ),
+            |expr| BooleanExpression::Not(Box::new(expr)),
+        ),
+        boolean_primary_expression,
+    ))(input)
+}
+
+fn boolean_primary_expression(input: &str) -> IResult<&str, BooleanExpression> {
+    let (input, _) = multispace0(input)?;
+    alt((
+        map(
+            delimited(
+                tuple((char('('), multispace0)),
+                boolean_expression,
+                tuple((multispace0, char(')'))),
+            ),
+            |expr| expr,
+        ),
+        comparison_expression,
+    ))(input)
+}
+
+fn comparison_expression(input: &str) -> IResult<&str, BooleanExpression> {
+    let (input, _) = multispace0(input)?;
     let (input, left) = value_expression(input)?;
     let (input, _) = multispace0(input)?;
     let (input, operator) = comparison_operator(input)?;
@@ -442,9 +499,20 @@ fn identifier(input: &str) -> IResult<&str, &str> {
 
 // Parse a string literal
 fn string_literal(input: &str) -> IResult<&str, String> {
+    alt((double_quoted_string, single_quoted_string))(input)
+}
+
+fn double_quoted_string(input: &str) -> IResult<&str, String> {
     let (input, _) = char('"')(input)?;
     let (input, content) = take_while1(|c| c != '"')(input)?;
     let (input, _) = char('"')(input)?;
+    Ok((input, content.to_string()))
+}
+
+fn single_quoted_string(input: &str) -> IResult<&str, String> {
+    let (input, _) = char('\'')(input)?;
+    let (input, content) = take_while1(|c| c != '\'')(input)?;
+    let (input, _) = char('\'')(input)?;
     Ok((input, content.to_string()))
 }
 
@@ -543,6 +611,7 @@ fn length_range(input: &str) -> IResult<&str, LengthRange> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ast::{BooleanExpression, ComparisonOperator, PropertyValue, ValueExpression};
 
     #[test]
     fn test_parse_simple_node_query() {
@@ -607,6 +676,54 @@ mod tests {
         let result = parse_cypher_query(query).unwrap();
 
         assert!(result.where_clause.is_some());
+    }
+
+    #[test]
+    fn test_parse_query_with_single_quoted_literal() {
+        let query = "MATCH (n:Person) WHERE n.name = 'Alice' RETURN n.name";
+        let result = parse_cypher_query(query).unwrap();
+
+        assert!(result.where_clause.is_some());
+    }
+
+    #[test]
+    fn test_parse_query_with_and_conditions() {
+        let query = "MATCH (src:Entity)-[rel:RELATIONSHIP]->(dst:Entity) WHERE rel.relationship_type = 'WORKS_ON' AND dst.name_lower = 'presto' RETURN src.name, src.entity_id";
+        let result = parse_cypher_query(query).unwrap();
+
+        let where_clause = result.where_clause.expect("Expected WHERE clause");
+        match where_clause.expression {
+            BooleanExpression::And(left, right) => {
+                match *left {
+                    BooleanExpression::Comparison {
+                        left: ValueExpression::Property(ref prop),
+                        operator,
+                        right: ValueExpression::Literal(PropertyValue::String(ref value)),
+                    } => {
+                        assert_eq!(prop.variable, "rel");
+                        assert_eq!(prop.property, "relationship_type");
+                        assert_eq!(operator, ComparisonOperator::Equal);
+                        assert_eq!(value, "WORKS_ON");
+                    }
+                    _ => panic!("Expected comparison for relationship_type filter"),
+                }
+
+                match *right {
+                    BooleanExpression::Comparison {
+                        left: ValueExpression::Property(ref prop),
+                        operator,
+                        right: ValueExpression::Literal(PropertyValue::String(ref value)),
+                    } => {
+                        assert_eq!(prop.variable, "dst");
+                        assert_eq!(prop.property, "name_lower");
+                        assert_eq!(operator, ComparisonOperator::Equal);
+                        assert_eq!(value, "presto");
+                    }
+                    _ => panic!("Expected comparison for destination name filter"),
+                }
+            }
+            other => panic!("Expected AND expression, got {:?}", other),
+        }
     }
 
     #[test]

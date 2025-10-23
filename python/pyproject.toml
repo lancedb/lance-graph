@@ -1,7 +1,13 @@
 [project]
 name = "lance-graph"
 dynamic = ["version"]
-dependencies = ["pyarrow>=14"]
+dependencies = [
+    "pyarrow>=14",
+    "pyyaml>=6.0",
+    "fastapi>=0.104.0",
+    "uvicorn>=0.24.0",
+    "pydantic>=2.0.0",
+]
 description = "Python bindings for the lance-graph Cypher engine"
 authors = [{ name = "Lance Devs", email = "dev@lancedb.com" }]
 license = { file = "LICENSE" }
@@ -37,6 +43,8 @@ build-backend = "maturin"
 [project.optional-dependencies]
 tests = ["pytest", "pyarrow>=14", "pandas"]
 dev = ["ruff", "pyright"]
+llm = ["openai>=1.52.0"]
+lance-storage = ["lance>=0.17.0"]
 
 [project.scripts]
 knowledge_graph = "knowledge_graph.main:main"
