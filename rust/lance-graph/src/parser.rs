@@ -13,7 +13,7 @@ use nom::{
     bytes::complete::{tag, tag_no_case, take_while1},
     character::complete::{char, multispace0, multispace1},
     combinator::{map, opt, recognize},
-    multi::{many0, separated_list0},
+    multi::{many0, separated_list0, separated_list1},
     sequence::{delimited, pair, preceded, tuple},
     IResult,
 };
@@ -316,6 +316,20 @@ fn comparison_expression(input: &str) -> IResult<&str, BooleanExpression> {
     let (input, _) = multispace0(input)?;
     let (input, left) = value_expression(input)?;
     let (input, _) = multispace0(input)?;
+    let left_clone = left.clone();
+
+    if let Ok((input_after_in, (_, _, list))) =
+        tuple((tag_no_case("IN"), multispace0, value_expression_list))(input)
+    {
+        return Ok((
+            input_after_in,
+            BooleanExpression::In {
+                expression: left,
+                list,
+            },
+        ));
+    }
+
     let (input, operator) = comparison_operator(input)?;
     let (input, _) = multispace0(input)?;
     let (input, right) = value_expression(input)?;
@@ -323,7 +337,7 @@ fn comparison_expression(input: &str) -> IResult<&str, BooleanExpression> {
     Ok((
         input,
         BooleanExpression::Comparison {
-            left,
+            left: left_clone,
             operator,
             right,
         },
@@ -350,6 +364,17 @@ fn value_expression(input: &str) -> IResult<&str, ValueExpression> {
         map(property_value, ValueExpression::Literal),
         map(identifier, |id| ValueExpression::Variable(id.to_string())),
     ))(input)
+}
+
+fn value_expression_list(input: &str) -> IResult<&str, Vec<ValueExpression>> {
+    delimited(
+        tuple((char('['), multispace0)),
+        separated_list1(
+            tuple((multispace0, char(','), multispace0)),
+            value_expression,
+        ),
+        tuple((multispace0, char(']'))),
+    )(input)
 }
 
 // Parse a property reference: variable.property
@@ -723,6 +748,39 @@ mod tests {
                 }
             }
             other => panic!("Expected AND expression, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_query_with_in_clause() {
+        let query = "MATCH (src:Entity)-[rel:RELATIONSHIP]->(dst:Entity) WHERE rel.relationship_type IN ['WORKS_FOR', 'PART_OF'] RETURN src.name";
+        let result = parse_cypher_query(query).unwrap();
+
+        let where_clause = result.where_clause.expect("Expected WHERE clause");
+        match where_clause.expression {
+            BooleanExpression::In { expression, list } => {
+                match expression {
+                    ValueExpression::Property(prop_ref) => {
+                        assert_eq!(prop_ref.variable, "rel");
+                        assert_eq!(prop_ref.property, "relationship_type");
+                    }
+                    _ => panic!("Expected property reference in IN expression"),
+                }
+                assert_eq!(list.len(), 2);
+                match &list[0] {
+                    ValueExpression::Literal(PropertyValue::String(val)) => {
+                        assert_eq!(val, "WORKS_FOR");
+                    }
+                    _ => panic!("Expected first list item to be a string literal"),
+                }
+                match &list[1] {
+                    ValueExpression::Literal(PropertyValue::String(val)) => {
+                        assert_eq!(val, "PART_OF");
+                    }
+                    _ => panic!("Expected second list item to be a string literal"),
+                }
+            }
+            other => panic!("Expected IN expression, got {:?}", other),
         }
     }
 

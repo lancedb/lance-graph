@@ -264,6 +264,15 @@ impl DataFusionPlanner {
                     right: Box::new(r),
                 })
             }
+            BE::In { expression, list } => {
+                use datafusion::logical_expr::expr::InList as DFInList;
+                let expr = self.to_df_value_expr(expression);
+                let list_exprs = list
+                    .iter()
+                    .map(|item| self.to_df_value_expr(item))
+                    .collect::<Vec<_>>();
+                Expr::InList(DFInList::new(Box::new(expr), list_exprs, false))
+            }
             BE::And(l, r) => Expr::BinaryExpr(BinaryExpr {
                 left: Box::new(self.to_df_boolean_expr(l)),
                 op: Operator::And,
@@ -332,6 +341,35 @@ mod tests {
                 .with_node_source("Person", person_src)
                 .with_relationship_source("KNOWS", knows_src),
         )
+    }
+
+    #[test]
+    fn test_df_boolean_expr_in_list() {
+        let cfg = crate::config::GraphConfig::builder().build().unwrap();
+        let planner = DataFusionPlanner::new(cfg);
+        let expr = BooleanExpression::In {
+            expression: ValueExpression::Property(PropertyRef {
+                variable: "rel".into(),
+                property: "relationship_type".into(),
+            }),
+            list: vec![
+                ValueExpression::Literal(PropertyValue::String("WORKS_FOR".into())),
+                ValueExpression::Literal(PropertyValue::String("PART_OF".into())),
+            ],
+        };
+
+        if let Expr::InList(in_list) = planner.to_df_boolean_expr(&expr) {
+            assert!(!in_list.negated);
+            assert_eq!(in_list.list.len(), 2);
+            match *in_list.expr {
+                Expr::Column(ref col_expr) => {
+                    assert_eq!(col_expr.name(), "relationship_type");
+                }
+                other => panic!("Expected column expression, got {:?}", other),
+            }
+        } else {
+            panic!("Expected InList expression");
+        }
     }
 
     #[test]

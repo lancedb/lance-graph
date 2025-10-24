@@ -398,6 +398,16 @@ def _build_query_prompt(
                 "question."
             ),
             (
+                "  • Use the schema summary and allowed relationship_type values to "
+                "identify candidate relationship directions and types."
+            ),
+            (
+                "  • When the schema lists relationship_type values and the question "
+                "does not narrow them down, treat the list as exhaustive and include "
+                "every value in your filter using OR clauses or "
+                "WHERE rel.relationship_type IN [...]."
+            ),
+            (
                 "Always specify node labels and relationship types in MATCH patterns "
                 "that introduce aliases."
             ),
@@ -405,12 +415,25 @@ def _build_query_prompt(
             ("  • MATCH (e:Entity) to scan entity rows (name, name_lower, entity_id)."),
             (
                 "  • MATCH (src:Entity)-[rel:RELATIONSHIP]->(dst:Entity) to traverse "
-                "relationships (relationship_type column)."
+                "relationships (relationship_type column); `src` aligns with "
+                "`source_entity_id` and `dst` with `target_entity_id`."
+            ),
+            (
+                "  • Decide which node should be `src` versus `dst` based on the "
+                "relationship meaning in the question and schema hints."
+            ),
+            (
+                "  • Map natural language roles (team, person, product, etc.) to the "
+                "`entity_type` column so queries filter to the expected entities."
             ),
             "  • Use WHERE e.column = 'value' for node-level filters.",
             (
                 "  • Filter relationships with WHERE rel.relationship_type = 'VALUE' "
-                "or by comparing rel.source_entity_id / rel.target_entity_id."
+                "or by comparing rel.source_entity_id / rel.target_entity_id; when the "
+                "question does not name a specific relationship type, include every "
+                "relevant value from the schema summary using OR clauses or "
+                "WHERE rel.relationship_type IN [...], explicitly note which values "
+                "you considered, and avoid emitting only a single guessed type."
             ),
             (
                 "  • Select columns using the aliases you define, such as e.name or "
@@ -421,8 +444,19 @@ def _build_query_prompt(
                 "filter rel.relationship_type instead of [:TYPE]."
             ),
             (
-                "Example: MATCH (src:Entity)-[rel:RELATIONSHIP]->(dst:Entity) "
-                f"WHERE rel.relationship_type = '{example_rel_type}' RETURN rel."
+                "Example: MATCH (part:Entity)-[rel:RELATIONSHIP]->(whole:Entity) "
+                f"WHERE rel.relationship_type = '{example_rel_type}' "
+                "RETURN part.name, whole.name."
+            ),
+            (
+                "Example: MATCH (a:Entity)-[rel:RELATIONSHIP]->(b:Entity) WHERE "
+                "rel.relationship_type = 'TYPE_A' OR rel.relationship_type = 'TYPE_B' "
+                "RETURN a.name, b.name."
+            ),
+            (
+                "Example: MATCH (src:Entity)-[rel:RELATIONSHIP]->(dst:Entity) WHERE "
+                "rel.relationship_type IN ['TYPE_A', 'TYPE_B', 'TYPE_C'] "
+                "RETURN src.name, dst.name."
             ),
             (
                 "Example: MATCH (dst:Entity) WHERE dst.name_lower = 'acme corp' "
