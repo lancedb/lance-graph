@@ -41,7 +41,7 @@ requires = ["maturin>=1.4"]
 build-backend = "maturin"
 
 [project.optional-dependencies]
-tests = ["pytest", "pyarrow>=14", "pandas"]
+tests = ["pytest", "pyarrow>=14", "pandas", "ruff"]
 dev = ["ruff", "pyright"]
 llm = ["openai>=1.52.0"]
 lance-storage = ["lance>=0.17.0"]

@@ -316,6 +316,7 @@ tests = [
     { name = "pandas" },
     { name = "pyarrow" },
     { name = "pytest" },
+    { name = "ruff" },
 ]
 
 [package.metadata]
@@ -331,6 +332,7 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'tests'" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "ruff", marker = "extra == 'dev'" },
+    { name = "ruff", marker = "extra == 'tests'" },
     { name = "uvicorn", specifier = ">=0.24.0" },
 ]
 provides-extras = ["tests", "dev", "llm", "lance-storage"]
