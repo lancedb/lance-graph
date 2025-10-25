@@ -14,12 +14,12 @@ from typing import TYPE_CHECKING, Any, Callable, Mapping, Optional, Sequence
 import yaml
 
 from . import extraction as kg_extraction
+from .config import KnowledgeGraphConfig
 from .embeddings import (
     DEFAULT_EMBEDDING_MODEL,
     EmbeddingGenerator,
     cosine_similarity,
 )
-from .config import KnowledgeGraphConfig
 from .service import LanceKnowledgeGraph
 from .store import LanceGraphStore
 
