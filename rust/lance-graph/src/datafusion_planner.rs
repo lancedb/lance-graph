@@ -468,6 +468,7 @@ mod tests {
             target_variable: "b".to_string(),
             relationship_types: vec!["KNOWS".to_string()],
             direction: crate::ast::RelationshipDirection::Outgoing,
+            relationship_variable: None,
             properties: Default::default(),
         };
         let project = LogicalOperator::Project {

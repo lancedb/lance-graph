@@ -36,6 +36,7 @@ pub enum LogicalOperator {
         target_variable: String,
         relationship_types: Vec<String>,
         direction: RelationshipDirection,
+        relationship_variable: Option<String>,
         properties: HashMap<String, PropertyValue>,
     },
 
@@ -46,6 +47,7 @@ pub enum LogicalOperator {
         target_variable: String,
         relationship_types: Vec<String>,
         direction: RelationshipDirection,
+        relationship_variable: Option<String>,
         min_length: Option<u32>,
         max_length: Option<u32>,
     },
@@ -308,6 +310,7 @@ impl LogicalPlanner {
                         target_variable: target_variable.clone(),
                         relationship_types: segment.relationship.types.clone(),
                         direction: segment.relationship.direction.clone(),
+                        relationship_variable: segment.relationship.variable.clone(),
                         properties: segment.relationship.properties.clone(),
                     }
                 }
@@ -317,6 +320,7 @@ impl LogicalPlanner {
                     target_variable: target_variable.clone(),
                     relationship_types: segment.relationship.types.clone(),
                     direction: segment.relationship.direction.clone(),
+                    relationship_variable: segment.relationship.variable.clone(),
                     min_length: length_range.min,
                     max_length: length_range.max,
                 },
@@ -326,6 +330,7 @@ impl LogicalPlanner {
                     target_variable: target_variable.clone(),
                     relationship_types: segment.relationship.types.clone(),
                     direction: segment.relationship.direction.clone(),
+                    relationship_variable: segment.relationship.variable.clone(),
                     properties: segment.relationship.properties.clone(),
                 },
             };
