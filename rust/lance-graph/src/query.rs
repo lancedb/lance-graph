@@ -189,6 +189,11 @@ impl CypherQuery {
         })
     }
 
+    /// Execute this Cypher query against Lance datasets
+    ///
+    /// Note: This initial implementation supports a single-table projection/filter/limit
+    /// workflow to enable basic end-to-end execution. Multi-table/path execution will be
+    /// wired up via the DataFusion planner in a follow-up.
     pub async fn execute(
         &self,
         datasets: HashMap<String, arrow::record_batch::RecordBatch>,
