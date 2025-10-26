@@ -73,7 +73,6 @@ impl<'a> LogicalPlanToSqlConverter<'a> {
 
             LogicalOperator::Sort { input, sort_items } => self.convert_sort(input, sort_items),
 
-            // Complex operations that should fall back to legacy execution
             LogicalOperator::VariableLengthExpand { .. } => Err(GraphError::PlanError {
                 message: "Variable length paths not supported in SQL conversion".to_string(),
                 location: snafu::Location::new(file!(), line!(), column!()),
@@ -150,6 +149,7 @@ impl<'a> LogicalPlanToSqlConverter<'a> {
         Ok(sql)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn convert_expand(
         &mut self,
         _input: &LogicalOperator,
