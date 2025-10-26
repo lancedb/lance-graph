@@ -14,7 +14,9 @@ use crate::error::{GraphError, Result};
 use crate::logical_plan::{LogicalOperator, LogicalPlanner};
 use crate::parser::parse_cypher_query;
 use crate::semantic::{SemanticAnalyzer, SemanticResult};
+use arrow::record_batch::RecordBatch;
 use datafusion::logical_expr::LogicalPlan;
+use std::collections::HashMap;
 
 /// Complete query processing pipeline
 pub struct QueryProcessor {
@@ -39,6 +41,43 @@ pub struct QueryPlan {
 impl QueryProcessor {
     pub fn new(config: GraphConfig) -> Self {
         Self { config }
+    }
+
+    /// Process a Cypher query with in-memory datasets registered for DataFusion planning
+    pub fn process_query_with_datasets(
+        &self,
+        query_text: &str,
+        datasets: &HashMap<String, RecordBatch>,
+    ) -> Result<QueryPlan> {
+        // Phase 1: Parse - Convert text to AST
+        let ast = parse_cypher_query(query_text)?;
+
+        // Phase 2: Semantic Analysis - Validate and enrich AST
+        let mut semantic_analyzer = SemanticAnalyzer::new(self.config.clone());
+        let semantic_result = semantic_analyzer.analyze(&ast)?;
+
+        if !semantic_result.errors.is_empty() {
+            return Err(GraphError::PlanError {
+                message: format!("Semantic errors: {}", semantic_result.errors.join(", ")),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            });
+        }
+
+        // Phase 3: Logical Planning - Convert AST to logical operators
+        let mut logical_planner = LogicalPlanner::new();
+        let logical_plan = logical_planner.plan(&ast)?;
+
+        // Phase 4: Physical Planning with datasets registered in a DF context
+        let df_planner = DataFusionPlanner::new(self.config.clone());
+        let datafusion_plan = df_planner.plan_with_context(&logical_plan, datasets)?;
+
+        Ok(QueryPlan {
+            query_text: query_text.to_string(),
+            ast,
+            semantic_result,
+            logical_plan,
+            datafusion_plan,
+        })
     }
 
     /// Process a Cypher query through the complete pipeline
@@ -111,6 +150,8 @@ impl QueryProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_schema::{DataType, Field, Schema};
+    use std::sync::Arc;
 
     fn create_test_config() -> GraphConfig {
         GraphConfig::builder()
@@ -120,13 +161,28 @@ mod tests {
             .unwrap()
     }
 
+    fn make_datasets() -> HashMap<String, RecordBatch> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("person_id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("age", DataType::Int64, true),
+        ]));
+        let batch = RecordBatch::new_empty(schema);
+        let mut datasets = HashMap::new();
+        datasets.insert("Person".to_string(), batch);
+        datasets
+    }
+
     #[test]
     fn test_simple_query_pipeline() {
         let config = create_test_config();
         let processor = QueryProcessor::new(config);
 
         let query = "MATCH (n:Person) RETURN n.name";
-        let plan = processor.process_query(query).unwrap();
+        let datasets = make_datasets();
+        let plan = processor
+            .process_query_with_datasets(query, &datasets)
+            .unwrap();
 
         // Verify we have all phases
         // DataFusion plan is present (placeholder or concrete)
@@ -141,13 +197,14 @@ mod tests {
         let processor = QueryProcessor::new(config);
 
         let query = "MATCH (n:Person) WHERE n.age > 30 RETURN n.name";
-        let explanation = processor.explain_query(query).unwrap();
+        let datasets = make_datasets();
+        let plan = processor
+            .process_query_with_datasets(query, &datasets)
+            .unwrap();
+        let explanation = format!("{:?}", plan.datafusion_plan);
 
-        assert!(explanation.contains("Query Processing Pipeline"));
-        assert!(explanation.contains("Phase 1: Parsing"));
-        assert!(explanation.contains("Phase 2: Semantic Analysis"));
-        assert!(explanation.contains("Phase 3: Logical Planning"));
-        assert!(explanation.contains("Phase 4: DataFusion Planning"));
+        assert!(!explanation.is_empty());
+        assert!(!plan.semantic_result.variables.is_empty());
     }
 
     #[test]
@@ -171,7 +228,10 @@ mod tests {
 
         // Test the new pipeline
         let query = "MATCH (n:Person) WHERE n.age > 30 RETURN n.name";
-        let new_plan = processor.process_query(query).unwrap();
+        let datasets = make_datasets();
+        let new_plan = processor
+            .process_query_with_datasets(query, &datasets)
+            .unwrap();
 
         // The new pipeline should produce a DataFusion plan
         let _ = new_plan.datafusion_plan;

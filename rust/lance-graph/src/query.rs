@@ -6,6 +6,7 @@
 use crate::ast::CypherQuery as CypherAST;
 use crate::config::GraphConfig;
 use crate::error::{GraphError, Result};
+use crate::logical_plan::LogicalPlanner;
 use crate::parser::parse_cypher_query;
 use std::collections::HashMap;
 
@@ -81,6 +82,111 @@ impl CypherQuery {
     /// Get query parameters
     pub fn parameters(&self) -> &HashMap<String, serde_json::Value> {
         &self.parameters
+    }
+
+    /// Execute using the DataFusion planner with enhanced filtering support
+    /// Pipeline: Semantic Analysis -> Logical Plan -> Physical Plan (DataFusion)
+    ///
+    /// This implementation uses DataFusion's DefaultTableSource with proper catalog
+    /// integration to support filtering and basic query operations.
+    ///
+    /// WARNING: Experimental API. Semantics (e.g., row multiplicity) and performance characteristics
+    /// may change as the DataFusion planner matures. Some features like ORDER BY are not yet implemented
+    /// in this path. Prefer the `execute` for stability, or opt into this method knowingly.
+    pub async fn execute_datafusion(
+        &self,
+        datasets: HashMap<String, arrow::record_batch::RecordBatch>,
+    ) -> Result<arrow::record_batch::RecordBatch> {
+        use crate::datafusion_planner::{DataFusionPlanner, GraphPhysicalPlanner};
+        use crate::semantic::SemanticAnalyzer;
+        use arrow::compute::concat_batches;
+        use datafusion::execution::context::SessionContext;
+
+        // Require a config for DataFusion execution
+        let config = self.config.as_ref().ok_or_else(|| GraphError::PlanError {
+            message: "Graph configuration is required for DataFusion execution".to_string(),
+            location: snafu::Location::new(file!(), line!(), column!()),
+        })?;
+
+        if datasets.is_empty() {
+            return Err(GraphError::PlanError {
+                message: "No input datasets provided".to_string(),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            });
+        }
+
+        // Phase 1: Semantic Analysis
+        let mut analyzer = SemanticAnalyzer::new(config.clone());
+        analyzer.analyze(&self.ast)?;
+
+        // Phase 2: Logical Planning
+        let mut logical_planner = LogicalPlanner::new();
+        let logical_plan = logical_planner.plan(&self.ast)?;
+
+        // Create session context and catalog, register tables in both
+        let ctx = SessionContext::new();
+        use crate::source_catalog::InMemoryCatalog;
+        use datafusion::datasource::{DefaultTableSource, MemTable};
+        use std::sync::Arc;
+
+        let mut catalog = InMemoryCatalog::new();
+
+        for (name, batch) in &datasets {
+            let mem_table = Arc::new(
+                MemTable::try_new(batch.schema(), vec![vec![batch.clone()]]).map_err(|e| {
+                    GraphError::PlanError {
+                        message: format!("Failed to create MemTable for {}: {}", name, e),
+                        location: snafu::Location::new(file!(), line!(), column!()),
+                    }
+                })?,
+            );
+
+            let table_source = Arc::new(DefaultTableSource::new(mem_table.clone()));
+
+            // Register as both node and relationship source (planner will use whichever is appropriate)
+            catalog = catalog.with_node_source(name, table_source.clone());
+            catalog = catalog.with_relationship_source(name, table_source);
+
+            // Register in session context for execution (using the same MemTable instance)
+            ctx.register_table(name, mem_table)
+                .map_err(|e| GraphError::PlanError {
+                    message: format!("Failed to register table {}: {}", name, e),
+                    location: snafu::Location::new(file!(), line!(), column!()),
+                })?;
+        }
+
+        // Use DataFusion planner with catalog that has the actual MemTables
+        let df_planner = DataFusionPlanner::with_catalog(config.clone(), Arc::new(catalog));
+        let df_logical_plan = df_planner.plan(&logical_plan)?;
+
+        // Execute the logical plan against the registered tables
+        let df = ctx
+            .execute_logical_plan(df_logical_plan)
+            .await
+            .map_err(|e| GraphError::PlanError {
+                message: format!("Failed to execute DataFusion plan: {}", e),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            })?;
+
+        // Collect results
+        let batches = df.collect().await.map_err(|e| GraphError::PlanError {
+            message: format!("Failed to collect DataFusion results: {}", e),
+            location: snafu::Location::new(file!(), line!(), column!()),
+        })?;
+
+        if batches.is_empty() {
+            // Return empty batch with schema from first dataset
+            let first_batch = datasets.values().next().unwrap();
+            let empty_batch = arrow::record_batch::RecordBatch::new_empty(first_batch.schema());
+            return Ok(empty_batch);
+        }
+
+        // Combine all batches
+        let schema = batches[0].schema();
+        concat_batches(&schema, &batches).map_err(|e| GraphError::PlanError {
+            message: format!("Failed to concatenate result batches: {}", e),
+            location: snafu::Location::new(file!(), line!(), column!()),
+        })
     }
 
     /// Execute this Cypher query against Lance datasets
@@ -1517,5 +1623,156 @@ mod tests {
         let ages = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
         let collected: Vec<i64> = (0..out.num_rows()).map(|i| ages.value(i)).collect();
         assert_eq!(collected, vec![30, 40]);
+    }
+
+    #[tokio::test]
+    async fn test_execute_datafusion_pipeline() {
+        use arrow_array::{Int64Array, RecordBatch, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        // Create test data
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("age", DataType::Int64, false),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie"])),
+                Arc::new(Int64Array::from(vec![25, 35, 30])),
+            ],
+        )
+        .unwrap();
+
+        let cfg = GraphConfig::builder()
+            .with_node_label("Person", "id")
+            .build()
+            .unwrap();
+
+        // Test simple node query with DataFusion pipeline
+        let query = CypherQuery::new("MATCH (p:Person) WHERE p.age > 30 RETURN p.name")
+            .unwrap()
+            .with_config(cfg);
+
+        let mut datasets = HashMap::new();
+        datasets.insert("Person".to_string(), batch);
+
+        // Execute using the new DataFusion pipeline
+        let result = query.execute_datafusion(datasets.clone()).await;
+
+        match &result {
+            Ok(batch) => {
+                println!(
+                    "DataFusion result: {} rows, {} columns",
+                    batch.num_rows(),
+                    batch.num_columns()
+                );
+                if batch.num_rows() > 0 {
+                    println!("First row data: {:?}", batch.slice(0, 1));
+                }
+            }
+            Err(e) => {
+                println!("DataFusion execution failed: {:?}", e);
+            }
+        }
+
+        // For comparison, try legacy execution
+        let legacy_result = query.execute(datasets).await.unwrap();
+        println!(
+            "Legacy result: {} rows, {} columns",
+            legacy_result.num_rows(),
+            legacy_result.num_columns()
+        );
+
+        let result = result.unwrap();
+
+        // Verify correct filtering: should return 1 row (Bob with age > 30)
+        assert_eq!(
+            result.num_rows(),
+            1,
+            "Expected 1 row after filtering WHERE p.age > 30"
+        );
+
+        // Verify correct projection: should return 1 column (name)
+        assert_eq!(
+            result.num_columns(),
+            1,
+            "Expected 1 column after projection RETURN p.name"
+        );
+
+        // Verify correct data: should contain "Bob"
+        let names = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(
+            names.value(0),
+            "Bob",
+            "Expected filtered result to contain Bob"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_datafusion_simple_scan() {
+        use arrow_array::{Int64Array, RecordBatch, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        use std::sync::Arc;
+
+        // Create test data
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["Alice", "Bob"])),
+            ],
+        )
+        .unwrap();
+
+        let cfg = GraphConfig::builder()
+            .with_node_label("Person", "id")
+            .build()
+            .unwrap();
+
+        // Test simple scan without filters
+        let query = CypherQuery::new("MATCH (p:Person) RETURN p.name")
+            .unwrap()
+            .with_config(cfg);
+
+        let mut datasets = HashMap::new();
+        datasets.insert("Person".to_string(), batch);
+
+        // Execute using DataFusion pipeline
+        let result = query.execute_datafusion(datasets).await.unwrap();
+
+        // Should return all rows
+        assert_eq!(
+            result.num_rows(),
+            2,
+            "Should return all 2 rows without filtering"
+        );
+        assert_eq!(result.num_columns(), 1, "Should return 1 column (name)");
+
+        // Verify data
+        let names = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let name_set: std::collections::HashSet<String> = (0..result.num_rows())
+            .map(|i| names.value(i).to_string())
+            .collect();
+        let expected: std::collections::HashSet<String> =
+            ["Alice", "Bob"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(name_set, expected, "Should return Alice and Bob");
     }
 }
