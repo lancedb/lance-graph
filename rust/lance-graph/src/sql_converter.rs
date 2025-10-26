@@ -7,10 +7,7 @@
 //! - **DataFusion**: Direct SQL execution via DataFusion's SQL interface
 //! - **LanceDB**: Native SQL execution with potential for vector/full-text extensions
 
-use crate::ast::{
-    BooleanExpression, ComparisonOperator, PropertyRef, PropertyValue, RelationshipDirection,
-    ValueExpression,
-};
+use crate::ast::{PropertyValue, RelationshipDirection, ValueExpression, BooleanExpression, ComparisonOperator, PropertyRef};
 use crate::config::GraphConfig;
 use crate::error::{GraphError, Result};
 use crate::logical_plan::{LogicalOperator, ProjectionItem, SortItem};
@@ -39,13 +36,13 @@ impl<'a> LogicalPlanToSqlConverter<'a> {
                 self.convert_project(input, projections)
             }
 
-            LogicalOperator::Filter { input, predicate } => self.convert_filter(input, predicate),
+            LogicalOperator::Filter { input, predicate } => {
+                self.convert_filter(input, predicate)
+            }
 
-            LogicalOperator::ScanByLabel {
-                variable,
-                label,
-                properties,
-            } => self.convert_scan(variable, label, properties),
+            LogicalOperator::ScanByLabel { variable, label, properties } => {
+                self.convert_scan(variable, label, properties)
+            }
 
             LogicalOperator::Expand {
                 input,
@@ -55,50 +52,59 @@ impl<'a> LogicalPlanToSqlConverter<'a> {
                 direction,
                 relationship_variable,
                 properties,
-            } => self.convert_expand(
-                input,
-                source_variable,
-                target_variable,
-                relationship_types,
-                direction,
-                relationship_variable,
-                properties,
-            ),
+            } => {
+                self.convert_expand(
+                    input,
+                    source_variable,
+                    target_variable,
+                    relationship_types,
+                    direction,
+                    relationship_variable,
+                    properties
+                )
+            }
 
-            LogicalOperator::Distinct { input } => self.convert_distinct(input),
+            LogicalOperator::Distinct { input } => {
+                self.convert_distinct(input)
+            }
 
-            LogicalOperator::Limit { input, count } => self.convert_limit(input, *count as i64),
+            LogicalOperator::Limit { input, count } => {
+                self.convert_limit(input, *count as i64)
+            }
 
-            LogicalOperator::Offset { input, offset } => self.convert_offset(input, *offset as i64),
+            LogicalOperator::Offset { input, offset } => {
+                self.convert_offset(input, *offset as i64)
+            }
 
-            LogicalOperator::Sort { input, sort_items } => self.convert_sort(input, sort_items),
+            LogicalOperator::Sort { input, sort_items } => {
+                self.convert_sort(input, sort_items)
+            }
 
             // Complex operations that should fall back to legacy execution
-            LogicalOperator::VariableLengthExpand { .. } => Err(GraphError::PlanError {
-                message: "Variable length paths not supported in SQL conversion".to_string(),
-                location: snafu::Location::new(file!(), line!(), column!()),
-            }),
+            LogicalOperator::VariableLengthExpand { .. } => {
+                Err(GraphError::PlanError {
+                    message: "Variable length paths not supported in SQL conversion".to_string(),
+                    location: snafu::Location::new(file!(), line!(), column!()),
+                })
+            }
 
-            LogicalOperator::Join { .. } => Err(GraphError::PlanError {
-                message: "Complex joins not supported in SQL conversion".to_string(),
-                location: snafu::Location::new(file!(), line!(), column!()),
-            }),
+            LogicalOperator::Join { .. } => {
+                Err(GraphError::PlanError {
+                    message: "Complex joins not supported in SQL conversion".to_string(),
+                    location: snafu::Location::new(file!(), line!(), column!()),
+                })
+            }
         }
     }
 
-    fn convert_project(
-        &mut self,
-        input: &LogicalOperator,
-        projections: &[ProjectionItem],
-    ) -> Result<String> {
+    fn convert_project(&mut self, input: &LogicalOperator, projections: &[ProjectionItem]) -> Result<String> {
         let input_sql = self.convert(input)?;
 
         if projections.is_empty() {
             return Ok(format!("SELECT * FROM ({})", input_sql));
         }
 
-        let proj_list = projections
-            .iter()
+        let proj_list = projections.iter()
             .map(|p| self.projection_to_sql(p))
             .collect::<Result<Vec<_>>>()?
             .join(", ");
@@ -106,42 +112,21 @@ impl<'a> LogicalPlanToSqlConverter<'a> {
         Ok(format!("SELECT {} FROM ({})", proj_list, input_sql))
     }
 
-    fn convert_filter(
-        &mut self,
-        input: &LogicalOperator,
-        predicate: &BooleanExpression,
-    ) -> Result<String> {
+    fn convert_filter(&mut self, input: &LogicalOperator, predicate: &BooleanExpression) -> Result<String> {
         let input_sql = self.convert(input)?;
         let where_clause = self.boolean_expr_to_sql(predicate)?;
-        Ok(format!(
-            "SELECT * FROM ({}) WHERE {}",
-            input_sql, where_clause
-        ))
+        Ok(format!("SELECT * FROM ({}) WHERE {}", input_sql, where_clause))
     }
 
-    fn convert_scan(
-        &mut self,
-        variable: &str,
-        label: &str,
-        properties: &HashMap<String, PropertyValue>,
-    ) -> Result<String> {
+    fn convert_scan(&mut self, variable: &str, label: &str, properties: &HashMap<String, PropertyValue>) -> Result<String> {
         // Store table alias for this variable - use the variable name as the alias
-        self.table_aliases
-            .insert(variable.to_string(), variable.to_string());
+        self.table_aliases.insert(variable.to_string(), variable.to_string());
 
         let mut sql = format!("SELECT * FROM {} AS {}", label, variable);
 
         if !properties.is_empty() {
-            let filters = properties
-                .iter()
-                .map(|(k, v)| {
-                    Ok(format!(
-                        "{}.{} = {}",
-                        variable,
-                        k,
-                        self.property_value_to_sql(v)?
-                    ))
-                })
+            let filters = properties.iter()
+                .map(|(k, v)| Ok(format!("{}.{} = {}", variable, k, self.property_value_to_sql(v)?)))
                 .collect::<Result<Vec<_>>>()?
                 .join(" AND ");
             sql = format!("{} WHERE {}", sql, filters);
@@ -161,25 +146,20 @@ impl<'a> LogicalPlanToSqlConverter<'a> {
         properties: &HashMap<String, PropertyValue>,
     ) -> Result<String> {
         let input_sql = self.convert(input)?;
-        let rel_type = relationship_types
-            .first()
-            .ok_or_else(|| GraphError::PlanError {
-                message: "No relationship type specified".to_string(),
-                location: snafu::Location::new(file!(), line!(), column!()),
-            })?;
+        let rel_type = relationship_types.first().ok_or_else(|| GraphError::PlanError {
+            message: "No relationship type specified".to_string(),
+            location: snafu::Location::new(file!(), line!(), column!()),
+        })?;
 
         let config = self.config.as_ref().ok_or_else(|| GraphError::PlanError {
             message: "Config required for relationship queries".to_string(),
             location: snafu::Location::new(file!(), line!(), column!()),
         })?;
 
-        let rel_mapping =
-            config
-                .get_relationship_mapping(rel_type)
-                .ok_or_else(|| GraphError::PlanError {
-                    message: format!("No relationship mapping for {}", rel_type),
-                    location: snafu::Location::new(file!(), line!(), column!()),
-                })?;
+        let rel_mapping = config.get_relationship_mapping(rel_type).ok_or_else(|| GraphError::PlanError {
+            message: format!("No relationship mapping for {}", rel_type),
+            location: snafu::Location::new(file!(), line!(), column!()),
+        })?;
 
         // Generate unique aliases
         let src_alias = format!("src_{}", self.variable_counter);
@@ -188,92 +168,19 @@ impl<'a> LogicalPlanToSqlConverter<'a> {
         self.variable_counter += 1;
 
         // Store aliases for variables
-        self.table_aliases
-            .insert(source_variable.to_string(), src_alias.clone());
-        self.table_aliases
-            .insert(target_variable.to_string(), tgt_alias.clone());
+        self.table_aliases.insert(source_variable.to_string(), src_alias.clone());
+        self.table_aliases.insert(target_variable.to_string(), tgt_alias.clone());
         if let Some(rel_var) = relationship_variable {
-            self.table_aliases
-                .insert(rel_var.clone(), rel_alias.clone());
+            self.table_aliases.insert(rel_var.clone(), rel_alias.clone());
         }
 
-        let join_sql = match direction {
-            RelationshipDirection::Outgoing => format!(
-                "({}) AS {} JOIN {} AS {} ON {}.id = {}.{} JOIN {} AS {} ON {}.{} = {}.id",
-                input_sql,
-                src_alias,
-                rel_type,
-                rel_alias,
-                src_alias,
-                rel_alias,
-                rel_mapping.source_id_field,
-                target_variable,
-                tgt_alias,
-                rel_alias,
-                rel_mapping.target_id_field,
-                tgt_alias
-            ),
-            RelationshipDirection::Incoming => format!(
-                "({}) AS {} JOIN {} AS {} ON {}.id = {}.{} JOIN {} AS {} ON {}.{} = {}.id",
-                input_sql,
-                src_alias,
-                rel_type,
-                rel_alias,
-                src_alias,
-                rel_alias,
-                rel_mapping.target_id_field,
-                target_variable,
-                tgt_alias,
-                rel_alias,
-                rel_mapping.source_id_field,
-                tgt_alias
-            ),
-            RelationshipDirection::Undirected => {
-                // For undirected, we need a UNION of both directions
-                let outgoing = format!(
-                    "({}) AS {} JOIN {} AS {} ON {}.id = {}.{} JOIN {} AS {} ON {}.{} = {}.id",
-                    input_sql,
-                    src_alias,
-                    rel_type,
-                    rel_alias,
-                    src_alias,
-                    rel_alias,
-                    rel_mapping.source_id_field,
-                    target_variable,
-                    tgt_alias,
-                    rel_alias,
-                    rel_mapping.target_id_field,
-                    tgt_alias
-                );
-                let incoming = format!(
-                    "({}) AS {}_2 JOIN {} AS {}_2 ON {}_2.id = {}_2.{} JOIN {} AS {}_2 ON {}_2.{} = {}_2.id",
-                    input_sql, src_alias, rel_type, rel_alias, src_alias, rel_alias, rel_mapping.target_id_field,
-                    target_variable, tgt_alias, rel_alias, rel_mapping.source_id_field, tgt_alias
-                );
-                format!("({}) UNION ALL ({})", outgoing, incoming)
-            }
-        };
-
-        let mut result_sql = format!("SELECT * FROM {}", join_sql);
-
-        // Add relationship property filters if any
-        if !properties.is_empty() {
-            let rel_filters = properties
-                .iter()
-                .map(|(k, v)| {
-                    Ok(format!(
-                        "{}.{} = {}",
-                        rel_alias,
-                        k,
-                        self.property_value_to_sql(v)?
-                    ))
-                })
-                .collect::<Result<Vec<_>>>()?
-                .join(" AND ");
-            result_sql = format!("{} WHERE {}", result_sql, rel_filters);
-        }
-
-        Ok(result_sql)
+        // TODO: This code hardcodes "id" but should use configured ID fields
+        // The problem is we need to track variable -> label mappings to get the right ID field
+        // For now, we'll return an error since relationship queries are unsupported anyway
+        Err(GraphError::PlanError {
+            message: "Relationship traversal not supported in SQL conversion - would require proper ID field mapping".to_string(),
+            location: snafu::Location::new(file!(), line!(), column!()),
+        })
     }
 
     fn convert_distinct(&mut self, input: &LogicalOperator) -> Result<String> {
@@ -291,11 +198,7 @@ impl<'a> LogicalPlanToSqlConverter<'a> {
         Ok(format!("SELECT * FROM ({}) OFFSET {}", input_sql, offset))
     }
 
-    fn convert_sort(
-        &mut self,
-        input: &LogicalOperator,
-        _sort_items: &[SortItem],
-    ) -> Result<String> {
+    fn convert_sort(&mut self, input: &LogicalOperator, _sort_items: &[SortItem]) -> Result<String> {
         // For now, just pass through the input (ORDER BY is complex to implement)
         // TODO: Implement proper ORDER BY conversion
         self.convert(input)
@@ -313,11 +216,7 @@ impl<'a> LogicalPlanToSqlConverter<'a> {
 
     fn boolean_expr_to_sql(&self, expr: &BooleanExpression) -> Result<String> {
         match expr {
-            BooleanExpression::Comparison {
-                left,
-                operator,
-                right,
-            } => {
+            BooleanExpression::Comparison { left, operator, right } => {
                 let left_sql = self.value_expr_to_sql(left)?;
                 let right_sql = self.value_expr_to_sql(right)?;
                 let op_sql = match operator {
@@ -333,8 +232,7 @@ impl<'a> LogicalPlanToSqlConverter<'a> {
 
             BooleanExpression::In { expression, list } => {
                 let expr_sql = self.value_expr_to_sql(expression)?;
-                let list_sql = list
-                    .iter()
+                let list_sql = list.iter()
                     .map(|v| self.value_expr_to_sql(v))
                     .collect::<Result<Vec<_>>>()?
                     .join(", ");
@@ -366,7 +264,7 @@ impl<'a> LogicalPlanToSqlConverter<'a> {
             _ => Err(GraphError::PlanError {
                 message: "Unsupported boolean expression in SQL conversion".to_string(),
                 location: snafu::Location::new(file!(), line!(), column!()),
-            }),
+            })
         }
     }
 
@@ -378,7 +276,7 @@ impl<'a> LogicalPlanToSqlConverter<'a> {
             _ => Err(GraphError::PlanError {
                 message: "Unsupported value expression in SQL conversion".to_string(),
                 location: snafu::Location::new(file!(), line!(), column!()),
-            }),
+            })
         }
     }
 
@@ -407,7 +305,7 @@ impl<'a> LogicalPlanToSqlConverter<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ast::{BooleanExpression, ComparisonOperator, PropertyRef, ValueExpression};
+    use crate::ast::{PropertyRef, ValueExpression, BooleanExpression, ComparisonOperator};
     use crate::logical_plan::{LogicalOperator, ProjectionItem};
     use std::collections::HashMap;
 
@@ -430,10 +328,7 @@ mod tests {
         let mut converter = LogicalPlanToSqlConverter::new(&None);
 
         let mut properties = HashMap::new();
-        properties.insert(
-            "name".to_string(),
-            PropertyValue::String("Alice".to_string()),
-        );
+        properties.insert("name".to_string(), PropertyValue::String("Alice".to_string()));
 
         let scan = LogicalOperator::ScanByLabel {
             variable: "n".to_string(),
@@ -493,9 +388,6 @@ mod tests {
         };
 
         let sql = converter.convert(&filter).unwrap();
-        assert_eq!(
-            sql,
-            "SELECT * FROM (SELECT * FROM Person AS n) WHERE n.age > 30"
-        );
+        assert_eq!(sql, "SELECT * FROM (SELECT * FROM Person AS n) WHERE n.age > 30");
     }
 }
