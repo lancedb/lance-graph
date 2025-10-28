@@ -83,12 +83,12 @@ pub struct QueryAnalysis {
 /// Represents a single relationship expansion with a unique instance ID
 #[derive(Debug, Clone)]
 pub struct RelationshipInstance {
-    pub id: usize,  // Unique instance number
+    pub id: usize, // Unique instance number
     pub rel_type: String,
     pub source_var: String,
     pub target_var: String,
     pub direction: RelationshipDirection,
-    pub alias: String,  // e.g., "friend_of_1", "friend_of_2"
+    pub alias: String, // e.g., "friend_of_1", "friend_of_2"
 }
 
 /// Parameters for joining source node to relationship
@@ -125,16 +125,15 @@ impl<'a> PlanningContext<'a> {
     }
 
     /// Get the next relationship instance for a given type (returns a clone)
-    pub fn next_relationship_instance(
-        &mut self,
-        rel_type: &str,
-    ) -> Result<RelationshipInstance> {
-        let idx = self.relationship_instance_idx
+    pub fn next_relationship_instance(&mut self, rel_type: &str) -> Result<RelationshipInstance> {
+        let idx = self
+            .relationship_instance_idx
             .entry(rel_type.to_string())
             .and_modify(|i| *i += 1)
             .or_insert(0);
 
-        self.analysis.relationship_instances
+        self.analysis
+            .relationship_instances
             .iter()
             .filter(|r| r.rel_type == rel_type)
             .nth(*idx)
@@ -215,76 +214,84 @@ fn analyze_operator(
     analysis: &mut QueryAnalysis,
     rel_counter: &mut HashMap<String, usize>,
 ) -> Result<()> {
-        match op {
-            LogicalOperator::ScanByLabel { variable, label, .. } => {
-                analysis.var_to_label.insert(variable.clone(), label.clone());
-                analysis.required_datasets.insert(label.clone());
+    match op {
+        LogicalOperator::ScanByLabel {
+            variable, label, ..
+        } => {
+            analysis
+                .var_to_label
+                .insert(variable.clone(), label.clone());
+            analysis.required_datasets.insert(label.clone());
+        }
+        LogicalOperator::Expand {
+            input,
+            source_variable,
+            target_variable,
+            relationship_types,
+            direction,
+            relationship_variable,
+            ..
+        }
+        | LogicalOperator::VariableLengthExpand {
+            input,
+            source_variable,
+            target_variable,
+            relationship_types,
+            direction,
+            relationship_variable,
+            ..
+        } => {
+            // Recursively analyze input first
+            analyze_operator(input, analysis, rel_counter)?;
+
+            // Infer target variable's label from source variable
+            // For (a:Person)-[:KNOWS]->(b), b also gets label Person
+            if let Some(source_label) = analysis.var_to_label.get(source_variable).cloned() {
+                analysis
+                    .var_to_label
+                    .insert(target_variable.clone(), source_label);
             }
-            LogicalOperator::Expand {
-                input,
-                source_variable,
-                target_variable,
-                relationship_types,
-                direction,
-                relationship_variable,
-                ..
-            } | LogicalOperator::VariableLengthExpand {
-                input,
-                source_variable,
-                target_variable,
-                relationship_types,
-                direction,
-                relationship_variable,
-                ..
-            } => {
-                // Recursively analyze input first
-                analyze_operator(input, analysis, rel_counter)?;
 
-                // Infer target variable's label from source variable
-                // For (a:Person)-[:KNOWS]->(b), b also gets label Person
-                if let Some(source_label) = analysis.var_to_label.get(source_variable).cloned() {
-                    analysis.var_to_label.insert(target_variable.clone(), source_label);
-                }
+            // Assign unique instance ID for this relationship
+            if let Some(rel_type) = relationship_types.first() {
+                let instance_id = rel_counter
+                    .entry(rel_type.clone())
+                    .and_modify(|c| *c += 1)
+                    .or_insert(1);
 
-                // Assign unique instance ID for this relationship
-                if let Some(rel_type) = relationship_types.first() {
-                    let instance_id = rel_counter.entry(rel_type.clone())
-                        .and_modify(|c| *c += 1)
-                        .or_insert(1);
+                // Use relationship variable if provided, otherwise use type_instanceId
+                let alias = if let Some(rel_var) = relationship_variable {
+                    rel_var.clone()
+                } else {
+                    format!("{}_{}", rel_type.to_lowercase(), instance_id)
+                };
 
-                    // Use relationship variable if provided, otherwise use type_instanceId
-                    let alias = if let Some(rel_var) = relationship_variable {
-                        rel_var.clone()
-                    } else {
-                        format!("{}_{}", rel_type.to_lowercase(), instance_id)
-                    };
+                analysis.relationship_instances.push(RelationshipInstance {
+                    id: *instance_id,
+                    rel_type: rel_type.clone(),
+                    source_var: source_variable.clone(),
+                    target_var: target_variable.clone(),
+                    direction: direction.clone(),
+                    alias,
+                });
 
-                    analysis.relationship_instances.push(RelationshipInstance {
-                        id: *instance_id,
-                        rel_type: rel_type.clone(),
-                        source_var: source_variable.clone(),
-                        target_var: target_variable.clone(),
-                        direction: direction.clone(),
-                        alias,
-                    });
-
-                    analysis.required_datasets.insert(rel_type.clone());
-                }
-            }
-            LogicalOperator::Filter { input, .. }
-            | LogicalOperator::Project { input, .. }
-            | LogicalOperator::Sort { input, .. }
-            | LogicalOperator::Limit { input, .. }
-            | LogicalOperator::Offset { input, .. }
-            | LogicalOperator::Distinct { input } => {
-                analyze_operator(input, analysis, rel_counter)?;
-            }
-            LogicalOperator::Join { left, right, .. } => {
-                analyze_operator(left, analysis, rel_counter)?;
-                analyze_operator(right, analysis, rel_counter)?;
+                analysis.required_datasets.insert(rel_type.clone());
             }
         }
-        Ok(())
+        LogicalOperator::Filter { input, .. }
+        | LogicalOperator::Project { input, .. }
+        | LogicalOperator::Sort { input, .. }
+        | LogicalOperator::Limit { input, .. }
+        | LogicalOperator::Offset { input, .. }
+        | LogicalOperator::Distinct { input } => {
+            analyze_operator(input, analysis, rel_counter)?;
+        }
+        LogicalOperator::Join { left, right, .. } => {
+            analyze_operator(left, analysis, rel_counter)?;
+            analyze_operator(right, analysis, rel_counter)?;
+        }
+    }
+    Ok(())
 }
 
 impl DataFusionPlanner {
@@ -401,8 +408,8 @@ impl DataFusionPlanner {
 
                 // Apply property filters using unqualified names (before aliasing)
                 for (k, v) in properties.iter() {
-                    let lit_expr = self
-                        .to_df_value_expr(&crate::ast::ValueExpression::Literal(v.clone()));
+                    let lit_expr =
+                        self.to_df_value_expr(&crate::ast::ValueExpression::Literal(v.clone()));
                     let filter_expr = Expr::BinaryExpr(BinaryExpr {
                         left: Box::new(col(k)),
                         op: Operator::Eq,
@@ -516,12 +523,8 @@ impl DataFusionPlanner {
         rel_source: Arc<dyn datafusion::logical_expr::TableSource>,
     ) -> Result<LogicalPlan> {
         let rel_schema = rel_source.schema();
-        let rel_builder = LogicalPlanBuilder::scan(
-            &rel_instance.rel_type,
-            rel_source,
-            None,
-        )
-        .unwrap();
+        let rel_builder =
+            LogicalPlanBuilder::scan(&rel_instance.rel_type, rel_source, None).unwrap();
 
         // Use unique alias from rel_instance to avoid column conflicts
         let rel_qualified_exprs: Vec<Expr> = rel_schema
@@ -576,7 +579,12 @@ impl DataFusionPlanner {
         params: &TargetJoinParams,
     ) -> Result<LogicalPlan> {
         // For now, assume target has same label as source (simplified)
-        let Some(target_label) = ctx.analysis.var_to_label.get(params.source_variable).cloned() else {
+        let Some(target_label) = ctx
+            .analysis
+            .var_to_label
+            .get(params.source_variable)
+            .cloned()
+        else {
             return Ok(builder.build().unwrap());
         };
 
@@ -592,7 +600,7 @@ impl DataFusionPlanner {
             .fields()
             .iter()
             .map(|field| {
-                let qualified_name = format!("{}__{}",params.target_variable, field.name());
+                let qualified_name = format!("{}__{}", params.target_variable, field.name());
                 col(field.name()).alias(&qualified_name)
             })
             .collect();
@@ -611,7 +619,8 @@ impl DataFusionPlanner {
         };
 
         let qualified_rel_target_key = format!("{}__{}", params.rel_qualifier, target_key);
-        let qualified_target_key = format!("{}__{}",params.target_variable, &params.node_map.id_field);
+        let qualified_target_key =
+            format!("{}__{}", params.target_variable, &params.node_map.id_field);
 
         builder = builder
             .join(

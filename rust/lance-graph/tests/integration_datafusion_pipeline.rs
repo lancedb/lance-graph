@@ -666,7 +666,7 @@ async fn test_datafusion_two_hop_basic() {
     // Edges: 1->2, 2->3, 3->4, 4->5, 1->3
     // Two-hop paths: 1->2->3, 2->3->4, 3->4->5, 1->3->4
     let query = CypherQuery::new(
-        "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) RETURN c.name"
+        "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) RETURN c.name",
     )
     .unwrap()
     .with_config(config);
@@ -708,7 +708,7 @@ async fn test_datafusion_two_hop_return_intermediate() {
 
     // Query: Return the intermediate node in two-hop paths
     let query = CypherQuery::new(
-        "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) RETURN b.name"
+        "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) RETURN b.name",
     )
     .unwrap()
     .with_config(config);
@@ -746,7 +746,7 @@ async fn test_datafusion_two_hop_return_all_three() {
 
     // Query: Return all three nodes in the path
     let query = CypherQuery::new(
-        "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) RETURN a.name, b.name, c.name"
+        "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) RETURN a.name, b.name, c.name",
     )
     .unwrap()
     .with_config(config);
@@ -759,9 +759,21 @@ async fn test_datafusion_two_hop_return_all_three() {
     assert_eq!(out.num_columns(), 3);
     assert_eq!(out.num_rows(), 4);
 
-    let a_names = out.column(0).as_any().downcast_ref::<StringArray>().unwrap();
-    let b_names = out.column(1).as_any().downcast_ref::<StringArray>().unwrap();
-    let c_names = out.column(2).as_any().downcast_ref::<StringArray>().unwrap();
+    let a_names = out
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let b_names = out
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let c_names = out
+        .column(2)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
 
     // Collect all paths
     let mut paths = Vec::new();
@@ -774,10 +786,26 @@ async fn test_datafusion_two_hop_return_all_three() {
     }
 
     // Expected paths: Alice->Bob->Charlie, Bob->Charlie->David, Charlie->David->Eve, Alice->Charlie->David
-    assert!(paths.contains(&("Alice".to_string(), "Bob".to_string(), "Charlie".to_string())));
-    assert!(paths.contains(&("Bob".to_string(), "Charlie".to_string(), "David".to_string())));
-    assert!(paths.contains(&("Charlie".to_string(), "David".to_string(), "Eve".to_string())));
-    assert!(paths.contains(&("Alice".to_string(), "Charlie".to_string(), "David".to_string())));
+    assert!(paths.contains(&(
+        "Alice".to_string(),
+        "Bob".to_string(),
+        "Charlie".to_string()
+    )));
+    assert!(paths.contains(&(
+        "Bob".to_string(),
+        "Charlie".to_string(),
+        "David".to_string()
+    )));
+    assert!(paths.contains(&(
+        "Charlie".to_string(),
+        "David".to_string(),
+        "Eve".to_string()
+    )));
+    assert!(paths.contains(&(
+        "Alice".to_string(),
+        "Charlie".to_string(),
+        "David".to_string()
+    )));
 }
 
 #[tokio::test]
@@ -788,7 +816,7 @@ async fn test_datafusion_two_hop_with_filter() {
 
     // Query: Two-hop with filter on intermediate node
     let query = CypherQuery::new(
-        "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) WHERE b.age > 30 RETURN c.name"
+        "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) WHERE b.age > 30 RETURN c.name",
     )
     .unwrap()
     .with_config(config);
@@ -827,7 +855,7 @@ async fn test_datafusion_two_hop_with_relationship_variable() {
 
     // Query: Two-hop with relationship variables
     let query = CypherQuery::new(
-        "MATCH (a:Person)-[r1:KNOWS]->(b:Person)-[r2:KNOWS]->(c:Person) RETURN a.name, c.name"
+        "MATCH (a:Person)-[r1:KNOWS]->(b:Person)-[r2:KNOWS]->(c:Person) RETURN a.name, c.name",
     )
     .unwrap()
     .with_config(config);
@@ -840,8 +868,16 @@ async fn test_datafusion_two_hop_with_relationship_variable() {
     assert_eq!(out.num_columns(), 2);
     assert_eq!(out.num_rows(), 4);
 
-    let a_names = out.column(0).as_any().downcast_ref::<StringArray>().unwrap();
-    let c_names = out.column(1).as_any().downcast_ref::<StringArray>().unwrap();
+    let a_names = out
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let c_names = out
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
 
     // Verify we get the correct source->target pairs
     let mut pairs = Vec::new();
@@ -863,7 +899,7 @@ async fn test_datafusion_two_hop_distinct() {
 
     // Query: Get distinct final destinations in two-hop paths
     let query = CypherQuery::new(
-        "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) RETURN DISTINCT c.name"
+        "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) RETURN DISTINCT c.name",
     )
     .unwrap()
     .with_config(config);
