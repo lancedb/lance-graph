@@ -5,6 +5,53 @@ use lance_graph::query::CypherQuery;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+// ============================================================================
+// Test Data Structure
+// ============================================================================
+//
+// Person Dataset (5 nodes):
+// | ID | Name    | Age | City          |
+// |----|---------|-----|---------------|
+// | 1  | Alice   | 25  | New York      |
+// | 2  | Bob     | 35  | San Francisco |
+// | 3  | Charlie | 30  | Chicago       |
+// | 4  | David   | 40  | NULL          |
+// | 5  | Eve     | 28  | Seattle       |
+//
+// KNOWS Relationship Dataset (5 edges):
+// | src_person_id | dst_person_id | since_year |
+// |---------------|---------------|------------|
+// | 1             | 2             | 2020       |
+// | 2             | 3             | 2019       |
+// | 3             | 4             | 2021       |
+// | 4             | 5             | NULL       |
+// | 1             | 3             | 2018       |
+//
+// Visual Graph Structure:
+//
+//     Alice(1) ──2020──> Bob(2) ──2019──> Charlie(3) ──2021──> David(4) ──NULL──> Eve(5)
+//        │                                    ▲
+//        └──────────────2018──────────────────┘
+//
+// Single-hop paths (5 edges):
+//   1. Alice → Bob
+//   2. Bob → Charlie
+//   3. Charlie → David
+//   4. David → Eve
+//   5. Alice → Charlie (shortcut)
+//
+// Two-hop paths (4 paths):
+//   1. Alice → Bob → Charlie
+//   2. Bob → Charlie → David
+//   3. Charlie → David → Eve
+//   4. Alice → Charlie → David
+//
+// Key characteristics:
+//   - Eve (5): Has no outgoing edges (dead end)
+//   - Alice (1): Has 2 outgoing edges (most connections)
+//   - David (4): Has NULL since_year and NULL city values
+// ============================================================================
+
 /// Helper function to create a Person dataset
 fn create_person_dataset() -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![
@@ -607,4 +654,302 @@ async fn test_datafusion_one_hop_filtered_source_age_strict() {
         .map(|s| s.to_string())
         .collect();
     assert_eq!(set, expected);
+}
+
+#[tokio::test]
+async fn test_datafusion_two_hop_basic() {
+    let config = create_graph_config();
+    let person_batch = create_person_dataset();
+    let knows_batch = create_knows_dataset();
+
+    // Query: Find friends of friends
+    // Edges: 1->2, 2->3, 3->4, 4->5, 1->3
+    // Two-hop paths: 1->2->3, 2->3->4, 3->4->5, 1->3->4
+    let query = CypherQuery::new(
+        "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) RETURN c.name",
+    )
+    .unwrap()
+    .with_config(config);
+
+    let mut datasets = HashMap::new();
+    datasets.insert("Person".to_string(), person_batch);
+    datasets.insert("KNOWS".to_string(), knows_batch);
+
+    let out = query.execute_datafusion(datasets).await.unwrap();
+
+    // Should return: Charlie (from 1->2->3), David (from 2->3->4 and 1->3->4), Eve (from 3->4->5)
+    assert_eq!(out.num_columns(), 1);
+    assert_eq!(out.num_rows(), 4); // 4 two-hop paths
+
+    let names = out
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+
+    let mut counts = HashMap::<String, usize>::new();
+    for i in 0..out.num_rows() {
+        *counts.entry(names.value(i).to_string()).or_insert(0) += 1;
+    }
+
+    // Verify counts: Charlie:1, David:2, Eve:1
+    assert_eq!(counts.get("Charlie"), Some(&1));
+    assert_eq!(counts.get("David"), Some(&2));
+    assert_eq!(counts.get("Eve"), Some(&1));
+    assert!(!counts.contains_key("Alice"));
+    assert!(!counts.contains_key("Bob"));
+}
+
+#[tokio::test]
+async fn test_datafusion_two_hop_return_intermediate() {
+    let config = create_graph_config();
+    let person_batch = create_person_dataset();
+    let knows_batch = create_knows_dataset();
+
+    // Query: Return the intermediate node in two-hop paths
+    let query = CypherQuery::new(
+        "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) RETURN b.name",
+    )
+    .unwrap()
+    .with_config(config);
+
+    let mut datasets = HashMap::new();
+    datasets.insert("Person".to_string(), person_batch);
+    datasets.insert("KNOWS".to_string(), knows_batch);
+
+    let out = query.execute_datafusion(datasets).await.unwrap();
+    assert_eq!(out.num_columns(), 1);
+    assert_eq!(out.num_rows(), 4);
+
+    let names = out
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+
+    let mut counts = HashMap::<String, usize>::new();
+    for i in 0..out.num_rows() {
+        *counts.entry(names.value(i).to_string()).or_insert(0) += 1;
+    }
+
+    // Intermediate nodes: Bob (1->2->3), Charlie (2->3->4 and 1->3->4), David (3->4->5)
+    assert_eq!(counts.get("Bob"), Some(&1));
+    assert_eq!(counts.get("Charlie"), Some(&2));
+    assert_eq!(counts.get("David"), Some(&1));
+}
+
+#[tokio::test]
+async fn test_datafusion_two_hop_return_all_three() {
+    let config = create_graph_config();
+    let person_batch = create_person_dataset();
+    let knows_batch = create_knows_dataset();
+
+    // Query: Return all three nodes in the path
+    let query = CypherQuery::new(
+        "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) RETURN a.name, b.name, c.name",
+    )
+    .unwrap()
+    .with_config(config);
+
+    let mut datasets = HashMap::new();
+    datasets.insert("Person".to_string(), person_batch);
+    datasets.insert("KNOWS".to_string(), knows_batch);
+
+    let out = query.execute_datafusion(datasets).await.unwrap();
+    assert_eq!(out.num_columns(), 3);
+    assert_eq!(out.num_rows(), 4);
+
+    let a_names = out
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let b_names = out
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let c_names = out
+        .column(2)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+
+    // Collect all paths
+    let mut paths = Vec::new();
+    for i in 0..out.num_rows() {
+        paths.push((
+            a_names.value(i).to_string(),
+            b_names.value(i).to_string(),
+            c_names.value(i).to_string(),
+        ));
+    }
+
+    // Expected paths: Alice->Bob->Charlie, Bob->Charlie->David, Charlie->David->Eve, Alice->Charlie->David
+    assert!(paths.contains(&(
+        "Alice".to_string(),
+        "Bob".to_string(),
+        "Charlie".to_string()
+    )));
+    assert!(paths.contains(&(
+        "Bob".to_string(),
+        "Charlie".to_string(),
+        "David".to_string()
+    )));
+    assert!(paths.contains(&(
+        "Charlie".to_string(),
+        "David".to_string(),
+        "Eve".to_string()
+    )));
+    assert!(paths.contains(&(
+        "Alice".to_string(),
+        "Charlie".to_string(),
+        "David".to_string()
+    )));
+}
+
+#[tokio::test]
+async fn test_datafusion_two_hop_with_filter() {
+    let config = create_graph_config();
+    let person_batch = create_person_dataset();
+    let knows_batch = create_knows_dataset();
+
+    // Query: Two-hop with filter on intermediate node
+    let query = CypherQuery::new(
+        "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) WHERE b.age > 30 RETURN c.name",
+    )
+    .unwrap()
+    .with_config(config);
+
+    let mut datasets = HashMap::new();
+    datasets.insert("Person".to_string(), person_batch);
+    datasets.insert("KNOWS".to_string(), knows_batch);
+
+    let out = query.execute_datafusion(datasets).await.unwrap();
+
+    // Filter: b.age > 30 means b can be Bob(35), David(40)
+    // Paths with Bob as intermediate: 1->2->3 (Alice->Bob->Charlie)
+    // Paths with David as intermediate: 3->4->5 (Charlie->David->Eve)
+    // No paths with Charlie(30) as intermediate
+    assert_eq!(out.num_rows(), 2);
+
+    let names = out
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+
+    let result_names: Vec<String> = (0..out.num_rows())
+        .map(|i| names.value(i).to_string())
+        .collect();
+
+    assert!(result_names.contains(&"Charlie".to_string()));
+    assert!(result_names.contains(&"Eve".to_string()));
+}
+
+#[tokio::test]
+async fn test_datafusion_two_hop_with_relationship_variable() {
+    let config = create_graph_config();
+    let person_batch = create_person_dataset();
+    let knows_batch = create_knows_dataset();
+
+    // Query: Two-hop with relationship variables
+    let query = CypherQuery::new(
+        "MATCH (a:Person)-[r1:KNOWS]->(b:Person)-[r2:KNOWS]->(c:Person) RETURN a.name, c.name",
+    )
+    .unwrap()
+    .with_config(config);
+
+    let mut datasets = HashMap::new();
+    datasets.insert("Person".to_string(), person_batch);
+    datasets.insert("KNOWS".to_string(), knows_batch);
+
+    let out = query.execute_datafusion(datasets).await.unwrap();
+    assert_eq!(out.num_columns(), 2);
+    assert_eq!(out.num_rows(), 4);
+
+    let a_names = out
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let c_names = out
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+
+    // Verify we get the correct source->target pairs
+    let mut pairs = Vec::new();
+    for i in 0..out.num_rows() {
+        pairs.push((a_names.value(i).to_string(), c_names.value(i).to_string()));
+    }
+
+    assert!(pairs.contains(&("Alice".to_string(), "Charlie".to_string())));
+    assert!(pairs.contains(&("Bob".to_string(), "David".to_string())));
+    assert!(pairs.contains(&("Charlie".to_string(), "Eve".to_string())));
+    assert!(pairs.contains(&("Alice".to_string(), "David".to_string())));
+}
+
+#[tokio::test]
+async fn test_datafusion_two_hop_distinct() {
+    let config = create_graph_config();
+    let person_batch = create_person_dataset();
+    let knows_batch = create_knows_dataset();
+
+    // Query: Get distinct final destinations in two-hop paths
+    let query = CypherQuery::new(
+        "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) RETURN DISTINCT c.name",
+    )
+    .unwrap()
+    .with_config(config);
+
+    let mut datasets = HashMap::new();
+    datasets.insert("Person".to_string(), person_batch);
+    datasets.insert("KNOWS".to_string(), knows_batch);
+
+    let out = query.execute_datafusion(datasets).await.unwrap();
+
+    // Distinct destinations: Charlie, David, Eve
+    assert_eq!(out.num_rows(), 3);
+
+    let names = out
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+
+    let result_set: std::collections::HashSet<String> = (0..out.num_rows())
+        .map(|i| names.value(i).to_string())
+        .collect();
+
+    let expected: std::collections::HashSet<String> = ["Charlie", "David", "Eve"]
+        .into_iter()
+        .map(|s| s.to_string())
+        .collect();
+
+    assert_eq!(result_set, expected);
+}
+
+#[tokio::test]
+async fn test_datafusion_two_hop_no_results() {
+    let config = create_graph_config();
+    let person_batch = create_person_dataset();
+    let knows_batch = create_knows_dataset();
+
+    // Query: Two-hop starting from Eve (who has no outgoing edges)
+    let query = CypherQuery::new(
+        "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) WHERE a.name = 'Eve' RETURN c.name"
+    )
+    .unwrap()
+    .with_config(config);
+
+    let mut datasets = HashMap::new();
+    datasets.insert("Person".to_string(), person_batch);
+    datasets.insert("KNOWS".to_string(), knows_batch);
+
+    let out = query.execute_datafusion(datasets).await.unwrap();
+
+    // Eve has no outgoing edges, so no two-hop paths
+    assert_eq!(out.num_rows(), 0);
 }
