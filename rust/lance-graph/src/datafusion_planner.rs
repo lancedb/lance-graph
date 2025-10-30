@@ -321,7 +321,15 @@ impl DataFusionPlanner {
                 let input_plan = self.build_operator(ctx, input)?;
                 let exprs: Vec<Expr> = projections
                     .iter()
-                    .map(|p| self.to_df_value_expr(&p.expression))
+                    .map(|p| {
+                        let expr = self.to_df_value_expr(&p.expression);
+                        // Apply alias if provided
+                        if let Some(alias) = &p.alias {
+                            expr.alias(alias)
+                        } else {
+                            expr
+                        }
+                    })
                     .collect();
                 Ok(LogicalPlanBuilder::from(input_plan)
                     .project(exprs)
@@ -1799,5 +1807,130 @@ mod tests {
         assert!(s.contains("Limit") || s.contains("limit"));
         assert!(s.contains("Sort") || s.contains("sort"));
         assert!(s.contains("n__name"));
+    }
+
+    #[test]
+    fn test_project_with_alias() {
+        use crate::ast::{PropertyRef, ValueExpression};
+        use crate::logical_plan::{LogicalOperator, ProjectionItem};
+
+        let cfg = crate::config::GraphConfig::builder()
+            .with_node_label("Person", "id")
+            .build()
+            .unwrap();
+        let planner = DataFusionPlanner::with_catalog(cfg, make_catalog());
+
+        let scan = LogicalOperator::ScanByLabel {
+            variable: "n".to_string(),
+            label: "Person".to_string(),
+            properties: Default::default(),
+        };
+
+        let project = LogicalOperator::Project {
+            input: Box::new(scan),
+            projections: vec![ProjectionItem {
+                expression: ValueExpression::Property(PropertyRef {
+                    variable: "n".to_string(),
+                    property: "name".to_string(),
+                }),
+                alias: Some("person_name".to_string()),
+            }],
+        };
+
+        let df_plan = planner.plan(&project).unwrap();
+        let s = format!("{:?}", df_plan);
+
+        // Should contain the alias
+        assert!(s.contains("person_name"));
+    }
+
+    #[test]
+    fn test_project_with_multiple_aliases() {
+        use crate::ast::{PropertyRef, ValueExpression};
+        use crate::logical_plan::{LogicalOperator, ProjectionItem};
+
+        let cfg = crate::config::GraphConfig::builder()
+            .with_node_label("Person", "id")
+            .build()
+            .unwrap();
+        let planner = DataFusionPlanner::with_catalog(cfg, make_catalog());
+
+        let scan = LogicalOperator::ScanByLabel {
+            variable: "p".to_string(),
+            label: "Person".to_string(),
+            properties: Default::default(),
+        };
+
+        let project = LogicalOperator::Project {
+            input: Box::new(scan),
+            projections: vec![
+                ProjectionItem {
+                    expression: ValueExpression::Property(PropertyRef {
+                        variable: "p".to_string(),
+                        property: "name".to_string(),
+                    }),
+                    alias: Some("name".to_string()),
+                },
+                ProjectionItem {
+                    expression: ValueExpression::Property(PropertyRef {
+                        variable: "p".to_string(),
+                        property: "age".to_string(),
+                    }),
+                    alias: Some("age".to_string()),
+                },
+            ],
+        };
+
+        let df_plan = planner.plan(&project).unwrap();
+        let s = format!("{:?}", df_plan);
+
+        // Should contain both aliases
+        assert!(s.contains("name"));
+        assert!(s.contains("age"));
+    }
+
+    #[test]
+    fn test_project_mixed_with_and_without_alias() {
+        use crate::ast::{PropertyRef, ValueExpression};
+        use crate::logical_plan::{LogicalOperator, ProjectionItem};
+
+        let cfg = crate::config::GraphConfig::builder()
+            .with_node_label("Person", "id")
+            .build()
+            .unwrap();
+        let planner = DataFusionPlanner::with_catalog(cfg, make_catalog());
+
+        let scan = LogicalOperator::ScanByLabel {
+            variable: "p".to_string(),
+            label: "Person".to_string(),
+            properties: Default::default(),
+        };
+
+        let project = LogicalOperator::Project {
+            input: Box::new(scan),
+            projections: vec![
+                ProjectionItem {
+                    expression: ValueExpression::Property(PropertyRef {
+                        variable: "p".to_string(),
+                        property: "name".to_string(),
+                    }),
+                    alias: Some("full_name".to_string()),
+                },
+                ProjectionItem {
+                    expression: ValueExpression::Property(PropertyRef {
+                        variable: "p".to_string(),
+                        property: "age".to_string(),
+                    }),
+                    alias: None, // No alias - should use qualified name
+                },
+            ],
+        };
+
+        let df_plan = planner.plan(&project).unwrap();
+        let s = format!("{:?}", df_plan);
+
+        // Should contain the alias and the qualified name
+        assert!(s.contains("full_name"));
+        assert!(s.contains("p__age"));
     }
 }
