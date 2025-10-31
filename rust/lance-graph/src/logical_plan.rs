@@ -30,26 +30,53 @@ pub enum LogicalOperator {
     },
 
     /// Traverse relationships (the core graph operation)
+    ///
+    /// Represents a single-hop relationship traversal: (source)-[rel]->(target)
     Expand {
+        /// The input operator (typically a node scan or previous expand)
         input: Box<LogicalOperator>,
+        /// Variable name for the source node (e.g., "a" in (a)-[]->(b))
         source_variable: String,
+        /// Variable name for the target node (e.g., "b" in (a)-[]->(b))
         target_variable: String,
+        /// Label of the target node (e.g., "Person", "Book")
+        /// This is essential for looking up the correct schema during planning
+        target_label: String,
+        /// Types of relationships to traverse (e.g., ["KNOWS", "FRIEND_OF"])
         relationship_types: Vec<String>,
+        /// Direction of traversal (Outgoing, Incoming, or Undirected)
         direction: RelationshipDirection,
+        /// Optional variable name for the relationship itself (e.g., "r" in -[r]->)
         relationship_variable: Option<String>,
+        /// Property filters to apply on the relationship
         properties: HashMap<String, PropertyValue>,
+        /// Property filters to apply on the target node
+        target_properties: HashMap<String, PropertyValue>,
     },
 
     /// Variable-length path expansion (*1..2 syntax)
+    ///
+    /// Represents multi-hop relationship traversals: (source)-[rel*min..max]->(target)
+    /// This is implemented by unrolling into multiple fixed-length paths and unioning them
     VariableLengthExpand {
+        /// The input operator (typically a node scan)
         input: Box<LogicalOperator>,
+        /// Variable name for the source node
         source_variable: String,
+        /// Variable name for the target node (reachable in min..max hops)
         target_variable: String,
+        /// Types of relationships to traverse in each hop
         relationship_types: Vec<String>,
+        /// Direction of traversal for each hop
         direction: RelationshipDirection,
+        /// Optional variable name for the relationship pattern
         relationship_variable: Option<String>,
+        /// Minimum number of hops (defaults to 1 if None)
         min_length: Option<u32>,
+        /// Maximum number of hops (defaults to system max if None)
         max_length: Option<u32>,
+        /// Property filters to apply on target nodes
+        target_properties: HashMap<String, PropertyValue>,
     },
 
     /// Project specific columns (RETURN clause)
@@ -297,7 +324,8 @@ impl LogicalPlanner {
                 .first()
                 .cloned()
                 .unwrap_or_else(|| "Node".to_string());
-            self.variables.insert(target_variable.clone(), target_label);
+            self.variables
+                .insert(target_variable.clone(), target_label.clone());
 
             // Optimize fixed-length var-length expansions (*1 or *1..1)
             let next_plan = match segment.relationship.length.as_ref() {
@@ -308,10 +336,12 @@ impl LogicalPlanner {
                         input: Box::new(plan),
                         source_variable: current_src.clone(),
                         target_variable: target_variable.clone(),
+                        target_label: target_label.clone(),
                         relationship_types: segment.relationship.types.clone(),
                         direction: segment.relationship.direction.clone(),
                         relationship_variable: segment.relationship.variable.clone(),
                         properties: segment.relationship.properties.clone(),
+                        target_properties: segment.end_node.properties.clone(),
                     }
                 }
                 Some(length_range) => LogicalOperator::VariableLengthExpand {
@@ -323,15 +353,18 @@ impl LogicalPlanner {
                     relationship_variable: segment.relationship.variable.clone(),
                     min_length: length_range.min,
                     max_length: length_range.max,
+                    target_properties: segment.end_node.properties.clone(),
                 },
                 None => LogicalOperator::Expand {
                     input: Box::new(plan),
                     source_variable: current_src.clone(),
                     target_variable: target_variable.clone(),
+                    target_label: target_label.clone(),
                     relationship_types: segment.relationship.types.clone(),
                     direction: segment.relationship.direction.clone(),
                     relationship_variable: segment.relationship.variable.clone(),
                     properties: segment.relationship.properties.clone(),
+                    target_properties: segment.end_node.properties.clone(),
                 },
             };
 

@@ -3,25 +3,16 @@
 
 //! DataFusion-based physical planner for graph queries
 //!
-//! This module translates graph logical plans into DataFusion logical plans for execution.
-//! It implements a two-phase planning approach:
+//! Translates graph logical plans into DataFusion logical plans using a two-phase approach:
 //!
 //! ## Phase 1: Analysis
-//! - Extracts metadata from the graph logical plan (from `logical_plan.rs`)
-//! - Assigns unique IDs to relationship instances to avoid column name conflicts
+//! - Assigns unique IDs to relationship instances to avoid column conflicts
 //! - Collects variable-to-label mappings and required datasets
 //!
 //! ## Phase 2: Plan Building
-//! - Converts graph operations to relational operations
-//! - Nodes as Tables: Each node label becomes a table scan
-//! - Relationships as Tables: Each relationship type becomes a linking table
-//! - Graph traversals become SQL joins with qualified column names
-//!
-//! ## Key Design Decisions
-//! - **Unique relationship aliases**: Each relationship expansion gets a unique alias
-//!   (e.g., `knows_1`, `knows_2`) to support multi-hop queries without column conflicts
-//! - **Relationship variables**: User-specified variables (e.g., `[r:KNOWS]`) take precedence
-//! - **Column qualification**: All columns are qualified as `{variable}__{column}` to avoid ambiguity
+//! - Nodes → Table scans, Relationships → Linking tables, Traversals → Joins
+//! - Variable-length paths (`*1..3`) use unrolling: generate fixed-length plans + UNION
+//! - All columns qualified as `{variable}__{column}` to avoid ambiguity
 
 use crate::ast::RelationshipDirection;
 use crate::error::Result;
@@ -102,12 +93,12 @@ struct SourceJoinParams<'a> {
 
 /// Parameters for joining relationship to target node
 struct TargetJoinParams<'a> {
-    source_variable: &'a str,
     target_variable: &'a str,
     rel_qualifier: &'a str,
     node_map: &'a crate::config::NodeMapping,
     rel_map: &'a crate::config::RelationshipMapping,
     direction: &'a RelationshipDirection,
+    target_properties: &'a HashMap<String, crate::ast::PropertyValue>,
 }
 
 /// Planning context that tracks state during plan building
@@ -227,15 +218,7 @@ fn analyze_operator(
             input,
             source_variable,
             target_variable,
-            relationship_types,
-            direction,
-            relationship_variable,
-            ..
-        }
-        | LogicalOperator::VariableLengthExpand {
-            input,
-            source_variable,
-            target_variable,
+            target_label,
             relationship_types,
             direction,
             relationship_variable,
@@ -244,13 +227,10 @@ fn analyze_operator(
             // Recursively analyze input first
             analyze_operator(input, analysis, rel_counter)?;
 
-            // Infer target variable's label from source variable
-            // For (a:Person)-[:KNOWS]->(b), b also gets label Person
-            if let Some(source_label) = analysis.var_to_label.get(source_variable).cloned() {
-                analysis
-                    .var_to_label
-                    .insert(target_variable.clone(), source_label);
-            }
+            // Register the target variable with its label from the logical plan
+            analysis
+                .var_to_label
+                .insert(target_variable.clone(), target_label.clone());
 
             // Assign unique instance ID for this relationship
             if let Some(rel_type) = relationship_types.first() {
@@ -274,6 +254,63 @@ fn analyze_operator(
                     direction: direction.clone(),
                     alias,
                 });
+
+                analysis.required_datasets.insert(rel_type.clone());
+            }
+        }
+        LogicalOperator::VariableLengthExpand {
+            input,
+            source_variable,
+            target_variable,
+            relationship_types,
+            direction,
+            relationship_variable,
+            min_length,
+            max_length,
+            ..
+        } => {
+            // Recursively analyze input first
+            analyze_operator(input, analysis, rel_counter)?;
+
+            // Infer target variable's label from source variable
+            // For (a:Person)-[:KNOWS]->(b), b also gets label Person
+            if let Some(source_label) = analysis.var_to_label.get(source_variable).cloned() {
+                analysis
+                    .var_to_label
+                    .insert(target_variable.clone(), source_label);
+            }
+
+            // For variable-length paths, register multiple instances (one per hop)
+            // We need to register instances for all possible hop counts
+            if let Some(rel_type) = relationship_types.first() {
+                let max_hops = max_length.unwrap_or(crate::MAX_VARIABLE_LENGTH_HOPS);
+                let min_hops = min_length.unwrap_or(1).max(1);
+
+                // Register instances for each hop count we'll generate
+                for hop_count in min_hops..=max_hops {
+                    for _ in 0..hop_count {
+                        let instance_id = rel_counter
+                            .entry(rel_type.clone())
+                            .and_modify(|c| *c += 1)
+                            .or_insert(1);
+
+                        // Use relationship variable if provided, otherwise use type_instanceId
+                        let alias = if let Some(rel_var) = relationship_variable {
+                            format!("{}_{}", rel_var, instance_id)
+                        } else {
+                            format!("{}_{}", rel_type.to_lowercase(), instance_id)
+                        };
+
+                        analysis.relationship_instances.push(RelationshipInstance {
+                            id: *instance_id,
+                            rel_type: rel_type.clone(),
+                            source_var: source_variable.clone(),
+                            target_var: target_variable.clone(),
+                            direction: direction.clone(),
+                            alias,
+                        });
+                    }
+                }
 
                 analysis.required_datasets.insert(rel_type.clone());
             }
@@ -390,24 +427,43 @@ impl DataFusionPlanner {
                 input,
                 source_variable,
                 target_variable,
+                target_label,
                 relationship_types,
                 direction,
-                ..
-            }
-            | LogicalOperator::VariableLengthExpand {
-                input,
-                source_variable,
-                target_variable,
-                relationship_types,
-                direction,
+                properties,
+                target_properties,
                 ..
             } => self.build_expand(
                 ctx,
                 input,
                 source_variable,
                 target_variable,
+                target_label,
                 relationship_types,
                 direction,
+                properties,
+                target_properties,
+            ),
+            LogicalOperator::VariableLengthExpand {
+                input,
+                source_variable,
+                target_variable,
+                relationship_types,
+                direction,
+                min_length,
+                max_length,
+                target_properties,
+                ..
+            } => self.build_variable_length_expand(
+                ctx,
+                input,
+                source_variable,
+                target_variable,
+                relationship_types,
+                direction,
+                *min_length,
+                *max_length,
+                target_properties,
             ),
             LogicalOperator::Join { left, .. } => {
                 // Not yet implemented: explicit join. For now, use left branch
@@ -482,14 +538,18 @@ impl DataFusionPlanner {
     }
 
     /// Build a relationship expansion (graph traversal) as a series of joins
+    #[allow(clippy::too_many_arguments)]
     fn build_expand(
         &self,
         ctx: &mut PlanningContext,
         input: &LogicalOperator,
         source_variable: &str,
         target_variable: &str,
+        target_label: &str,
         relationship_types: &[String],
         direction: &RelationshipDirection,
+        relationship_properties: &HashMap<String, crate::ast::PropertyValue>,
+        target_properties: &HashMap<String, crate::ast::PropertyValue>,
     ) -> Result<LogicalPlan> {
         let left_plan = self.build_operator(ctx, input)?;
 
@@ -520,8 +580,9 @@ impl DataFusionPlanner {
             return Ok(left_plan);
         };
 
-        // Build relationship scan with qualified columns
-        let rel_scan = self.build_relationship_scan(&rel_instance, rel_source)?;
+        // Build relationship scan with qualified columns and property filters
+        let rel_scan =
+            self.build_relationship_scan(&rel_instance, rel_source, relationship_properties)?;
 
         // Join source node with relationship
         let source_params = SourceJoinParams {
@@ -533,27 +594,46 @@ impl DataFusionPlanner {
         };
         let builder = self.join_source_to_relationship(left_plan, rel_scan, &source_params)?;
 
-        // Join relationship with target node
+        // Join relationship with target node using the explicit target_label
+        let target_node_map = self.config.node_mappings.get(target_label).ok_or_else(|| {
+            crate::error::GraphError::ConfigError {
+                message: format!("No mapping found for target label: {}", target_label),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            }
+        })?;
+
         let target_params = TargetJoinParams {
-            source_variable,
             target_variable,
             rel_qualifier: &rel_instance.alias,
-            node_map,
+            node_map: target_node_map,
             rel_map,
             direction,
+            target_properties,
         };
         self.join_relationship_to_target(builder, cat, ctx, &target_params)
     }
 
-    /// Build a qualified relationship scan
+    /// Build a qualified relationship scan with property filters
     fn build_relationship_scan(
         &self,
         rel_instance: &RelationshipInstance,
         rel_source: Arc<dyn datafusion::logical_expr::TableSource>,
+        relationship_properties: &HashMap<String, crate::ast::PropertyValue>,
     ) -> Result<LogicalPlan> {
         let rel_schema = rel_source.schema();
-        let rel_builder =
+        let mut rel_builder =
             LogicalPlanBuilder::scan(&rel_instance.rel_type, rel_source, None).unwrap();
+
+        // Apply relationship property filters (e.g., -[r {since: 2020}]->)
+        for (k, v) in relationship_properties.iter() {
+            let lit_expr = self.to_df_value_expr(&crate::ast::ValueExpression::Literal(v.clone()));
+            let filter_expr = Expr::BinaryExpr(BinaryExpr {
+                left: Box::new(col(k)),
+                op: Operator::Eq,
+                right: Box::new(lit_expr),
+            });
+            rel_builder = rel_builder.filter(filter_expr).unwrap();
+        }
 
         // Use unique alias from rel_instance to avoid column conflicts
         let rel_qualified_exprs: Vec<Expr> = rel_schema
@@ -607,11 +687,11 @@ impl DataFusionPlanner {
         ctx: &PlanningContext,
         params: &TargetJoinParams,
     ) -> Result<LogicalPlan> {
-        // For now, assume target has same label as source (simplified)
+        // Get the target label from the analysis (which now has the correct label from Expand)
         let Some(target_label) = ctx
             .analysis
             .var_to_label
-            .get(params.source_variable)
+            .get(params.target_variable)
             .cloned()
         else {
             return Ok(builder.build().unwrap());
@@ -621,9 +701,21 @@ impl DataFusionPlanner {
             return Ok(builder.build().unwrap());
         };
 
-        // Create target node scan with qualified column aliases
+        // Create target node scan with qualified column aliases and property filters
         let target_schema = target_source.schema();
-        let target_builder = LogicalPlanBuilder::scan(&target_label, target_source, None).unwrap();
+        let mut target_builder =
+            LogicalPlanBuilder::scan(&target_label, target_source, None).unwrap();
+
+        // Apply target property filters (e.g., (b {age: 30}))
+        for (k, v) in params.target_properties.iter() {
+            let lit_expr = self.to_df_value_expr(&crate::ast::ValueExpression::Literal(v.clone()));
+            let filter_expr = Expr::BinaryExpr(BinaryExpr {
+                left: Box::new(col(k)),
+                op: Operator::Eq,
+                right: Box::new(lit_expr),
+            });
+            target_builder = target_builder.filter(filter_expr).unwrap();
+        }
 
         let target_qualified_exprs: Vec<Expr> = target_schema
             .fields()
@@ -661,6 +753,523 @@ impl DataFusionPlanner {
             .unwrap();
 
         Ok(builder.build().unwrap())
+    }
+
+    /// Get the expected qualified column names for variable-length path results
+    ///
+    /// Derives the column set from actual source and target node schemas rather than
+    /// using fragile prefix matching. This prevents accidentally including intermediate
+    /// node columns or missing renamed properties.
+    fn get_expected_varlength_columns(
+        &self,
+        ctx: &PlanningContext,
+        source_variable: &str,
+        target_variable: &str,
+    ) -> Result<std::collections::HashSet<String>> {
+        use std::collections::HashSet;
+
+        let mut expected = HashSet::new();
+
+        let Some(cat) = &self.catalog else {
+            return Ok(expected);
+        };
+
+        // Get source node label and schema
+        if let Some(source_label) = ctx.analysis.var_to_label.get(source_variable) {
+            if let Some(source) = cat.node_source(source_label) {
+                let source_schema = source.schema();
+                for field in source_schema.fields() {
+                    let qualified_name = format!("{}__{}", source_variable, field.name());
+                    expected.insert(qualified_name);
+                }
+            }
+        }
+
+        // Get target node label and schema
+        if let Some(target_label) = ctx.analysis.var_to_label.get(target_variable) {
+            if let Some(target) = cat.node_source(target_label) {
+                let target_schema = target.schema();
+                for field in target_schema.fields() {
+                    let qualified_name = format!("{}__{}", target_variable, field.name());
+                    expected.insert(qualified_name);
+                }
+            }
+        }
+
+        Ok(expected)
+    }
+
+    /// Build variable-length path expansion using unrolling + UNION strategy
+    ///
+    /// For a query like: (a)-[:KNOWS*1..3]->(b)
+    /// This generates:
+    ///   1-hop plan UNION 2-hop plan UNION 3-hop plan
+    #[allow(clippy::too_many_arguments)]
+    fn build_variable_length_expand(
+        &self,
+        ctx: &mut PlanningContext,
+        input: &LogicalOperator,
+        source_variable: &str,
+        target_variable: &str,
+        relationship_types: &[String],
+        direction: &RelationshipDirection,
+        min_length: Option<u32>,
+        max_length: Option<u32>,
+        target_properties: &HashMap<String, crate::ast::PropertyValue>,
+    ) -> Result<LogicalPlan> {
+        let min_hops = min_length.unwrap_or(1).max(1);
+        let max_hops = max_length.unwrap_or(crate::MAX_VARIABLE_LENGTH_HOPS);
+
+        // Validate range
+        if min_hops > max_hops {
+            return Err(crate::error::GraphError::InvalidPattern {
+                message: format!(
+                    "Invalid variable-length range: min {} > max {}",
+                    min_hops, max_hops
+                ),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            });
+        }
+
+        if max_hops > crate::MAX_VARIABLE_LENGTH_HOPS {
+            return Err(crate::error::GraphError::UnsupportedFeature {
+                feature: format!(
+                    "Variable-length paths with max length > {} (got {})",
+                    crate::MAX_VARIABLE_LENGTH_HOPS,
+                    max_hops
+                ),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            });
+        }
+
+        // Build the input plan (source node scan)
+        let input_plan = self.build_operator(ctx, input)?;
+
+        // Derive expected column names from source and target node schemas
+        // This ensures we only project columns that actually belong to source/target nodes
+        let expected_columns =
+            self.get_expected_varlength_columns(ctx, source_variable, target_variable)?;
+
+        // Generate a plan for each hop count and UNION them
+        let mut plans = Vec::new();
+
+        for hop_count in min_hops..=max_hops {
+            let mut plan = self.build_fixed_length_path(
+                ctx,
+                input_plan.clone(),
+                source_variable,
+                target_variable,
+                relationship_types,
+                direction,
+                hop_count,
+                target_properties,
+            )?;
+
+            // Project only source and target columns to ensure consistent schema for UNION
+            // This removes intermediate node columns that vary by hop count
+            // Use the pre-computed expected column set derived from actual node schemas
+            let projection: Vec<Expr> = plan
+                .schema()
+                .fields()
+                .iter()
+                .filter(|f| expected_columns.contains(f.name().as_str()))
+                .map(|f| col(f.name()))
+                .collect();
+
+            plan = LogicalPlanBuilder::from(plan)
+                .project(projection)
+                .map_err(|e| crate::error::GraphError::PlanError {
+                    message: format!("Failed to project for UNION: {}", e),
+                    location: snafu::Location::new(file!(), line!(), column!()),
+                })?
+                .build()
+                .map_err(|e| crate::error::GraphError::PlanError {
+                    message: format!("Failed to build projection: {}", e),
+                    location: snafu::Location::new(file!(), line!(), column!()),
+                })?;
+
+            plans.push(plan);
+        }
+
+        // UNION all plans together
+        if plans.len() == 1 {
+            Ok(plans.into_iter().next().unwrap())
+        } else {
+            // Build UNION of all plans
+            let mut union_plan = plans[0].clone();
+            for plan in plans.into_iter().skip(1) {
+                union_plan = LogicalPlanBuilder::from(union_plan)
+                    .union(plan)
+                    .map_err(|e| crate::error::GraphError::PlanError {
+                        message: format!("Failed to UNION variable-length paths: {}", e),
+                        location: snafu::Location::new(file!(), line!(), column!()),
+                    })?
+                    .build()
+                    .map_err(|e| crate::error::GraphError::PlanError {
+                        message: format!("Failed to build UNION plan: {}", e),
+                        location: snafu::Location::new(file!(), line!(), column!()),
+                    })?;
+            }
+            Ok(union_plan)
+        }
+    }
+
+    /// Build a fixed-length path of N hops
+    ///
+    /// For hop_count=3: (a)-[:KNOWS]->(temp1)-[:KNOWS]->(temp2)-[:KNOWS]->(b)
+    #[allow(clippy::too_many_arguments)]
+    fn build_fixed_length_path(
+        &self,
+        ctx: &mut PlanningContext,
+        input_plan: LogicalPlan,
+        source_variable: &str,
+        target_variable: &str,
+        relationship_types: &[String],
+        direction: &RelationshipDirection,
+        hop_count: u32,
+        target_properties: &HashMap<String, crate::ast::PropertyValue>,
+    ) -> Result<LogicalPlan> {
+        let mut current_plan = input_plan;
+        let mut current_source = source_variable.to_string();
+
+        for hop_index in 0..hop_count {
+            let is_last_hop = hop_index == hop_count - 1;
+
+            // Target variable: use actual target on last hop, temp variable otherwise
+            let current_target = if is_last_hop {
+                target_variable.to_string()
+            } else {
+                format!("_temp_{}_{}", source_variable, hop_index + 1)
+            };
+
+            // Build the expansion on top of current plan
+            // Apply target properties only on the last hop
+            let props_to_apply = if is_last_hop {
+                target_properties
+            } else {
+                &HashMap::new()
+            };
+
+            current_plan = self.build_expand_on_plan(
+                ctx,
+                current_plan,
+                &current_source,
+                &current_target,
+                relationship_types,
+                direction,
+                props_to_apply,
+            )?;
+
+            // Move to next hop
+            current_source = current_target;
+        }
+
+        Ok(current_plan)
+    }
+
+    /// Build a single-hop expansion on top of an existing plan
+    #[allow(clippy::too_many_arguments)]
+    fn build_expand_on_plan(
+        &self,
+        ctx: &mut PlanningContext,
+        input_plan: LogicalPlan,
+        source_variable: &str,
+        target_variable: &str,
+        relationship_types: &[String],
+        direction: &RelationshipDirection,
+        target_properties: &HashMap<String, crate::ast::PropertyValue>,
+    ) -> Result<LogicalPlan> {
+        let rel_type =
+            relationship_types
+                .first()
+                .ok_or_else(|| crate::error::GraphError::InvalidPattern {
+                    message: "Expand requires at least one relationship type".to_string(),
+                    location: snafu::Location::new(file!(), line!(), column!()),
+                })?;
+
+        let rel_instance = ctx.next_relationship_instance(rel_type)?;
+        let rel_map = self.get_relationship_mapping(rel_type)?;
+        let (target_label, node_map) = self.get_target_node_mapping(ctx, target_variable)?;
+        let catalog = self.get_catalog()?;
+
+        // Build relationship scan and join
+        let rel_scan = self.build_qualified_relationship_scan(catalog, &rel_instance)?;
+        let mut builder = self.join_relationship_to_input(
+            input_plan,
+            rel_scan,
+            source_variable,
+            &rel_instance,
+            rel_map,
+            node_map,
+            direction,
+        )?;
+
+        // Build target node scan and join
+        let target_scan = self.build_qualified_target_scan(
+            catalog,
+            &target_label,
+            target_variable,
+            target_properties,
+        )?;
+        builder = self.join_target_to_builder(
+            builder,
+            target_scan,
+            target_variable,
+            &rel_instance,
+            rel_map,
+            node_map,
+            direction,
+        )?;
+
+        builder
+            .build()
+            .map_err(|e| crate::error::GraphError::PlanError {
+                message: format!("Failed to build expansion plan: {}", e),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            })
+    }
+
+    /// Get relationship mapping from config
+    fn get_relationship_mapping(
+        &self,
+        rel_type: &str,
+    ) -> Result<&crate::config::RelationshipMapping> {
+        self.config
+            .relationship_mappings
+            .get(rel_type)
+            .ok_or_else(|| crate::error::GraphError::ConfigError {
+                message: format!("No mapping found for relationship type: {}", rel_type),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            })
+    }
+
+    /// Get target node mapping from context
+    fn get_target_node_mapping(
+        &self,
+        ctx: &PlanningContext,
+        target_variable: &str,
+    ) -> Result<(String, &crate::config::NodeMapping)> {
+        let target_label = ctx
+            .analysis
+            .var_to_label
+            .get(target_variable)
+            .or_else(|| self.config.node_mappings.keys().next())
+            .ok_or_else(|| crate::error::GraphError::ConfigError {
+                message: format!(
+                    "Cannot infer target label for variable: {}",
+                    target_variable
+                ),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            })?
+            .clone();
+
+        let node_map = self
+            .config
+            .node_mappings
+            .get(&target_label)
+            .ok_or_else(|| crate::error::GraphError::ConfigError {
+                message: format!("No mapping found for node label: {}", target_label),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            })?;
+
+        Ok((target_label, node_map))
+    }
+
+    /// Get catalog reference
+    fn get_catalog(&self) -> Result<&Arc<dyn GraphSourceCatalog>> {
+        self.catalog
+            .as_ref()
+            .ok_or_else(|| crate::error::GraphError::ConfigError {
+                message: "Catalog not available".to_string(),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            })
+    }
+
+    /// Build a qualified relationship scan for expansion
+    fn build_qualified_relationship_scan(
+        &self,
+        catalog: &Arc<dyn GraphSourceCatalog>,
+        rel_instance: &RelationshipInstance,
+    ) -> Result<LogicalPlan> {
+        let rel_source = catalog
+            .relationship_source(&rel_instance.rel_type)
+            .ok_or_else(|| crate::error::GraphError::ConfigError {
+                message: format!(
+                    "No table source found for relationship: {}",
+                    rel_instance.rel_type
+                ),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            })?;
+
+        let rel_schema = rel_source.schema();
+        let rel_builder = LogicalPlanBuilder::scan(&rel_instance.rel_type, rel_source, None)
+            .map_err(|e| crate::error::GraphError::PlanError {
+                message: format!("Failed to scan relationship: {}", e),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            })?;
+
+        let rel_qualified_exprs: Vec<Expr> = rel_schema
+            .fields()
+            .iter()
+            .map(|field| {
+                let qualified_name = format!("{}__{}", rel_instance.alias, field.name());
+                col(field.name()).alias(&qualified_name)
+            })
+            .collect();
+
+        rel_builder
+            .project(rel_qualified_exprs)
+            .map_err(|e| crate::error::GraphError::PlanError {
+                message: format!("Failed to project relationship: {}", e),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            })?
+            .build()
+            .map_err(|e| crate::error::GraphError::PlanError {
+                message: format!("Failed to build relationship scan: {}", e),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            })
+    }
+
+    /// Get relationship join key based on direction (source side)
+    fn get_source_join_key<'a>(
+        direction: &RelationshipDirection,
+        rel_map: &'a crate::config::RelationshipMapping,
+    ) -> &'a str {
+        match direction {
+            RelationshipDirection::Outgoing => &rel_map.source_id_field,
+            RelationshipDirection::Incoming => &rel_map.target_id_field,
+            RelationshipDirection::Undirected => &rel_map.source_id_field,
+        }
+    }
+
+    /// Get relationship join key based on direction (target side)
+    fn get_target_join_key<'a>(
+        direction: &RelationshipDirection,
+        rel_map: &'a crate::config::RelationshipMapping,
+    ) -> &'a str {
+        match direction {
+            RelationshipDirection::Outgoing => &rel_map.target_id_field,
+            RelationshipDirection::Incoming => &rel_map.source_id_field,
+            RelationshipDirection::Undirected => &rel_map.target_id_field,
+        }
+    }
+
+    /// Join input plan with relationship scan
+    #[allow(clippy::too_many_arguments)]
+    fn join_relationship_to_input(
+        &self,
+        input_plan: LogicalPlan,
+        rel_scan: LogicalPlan,
+        source_variable: &str,
+        rel_instance: &RelationshipInstance,
+        rel_map: &crate::config::RelationshipMapping,
+        node_map: &crate::config::NodeMapping,
+        direction: &RelationshipDirection,
+    ) -> Result<LogicalPlanBuilder> {
+        let source_key = Self::get_source_join_key(direction, rel_map);
+        let qualified_source_key = format!("{}__{}", source_variable, &node_map.id_field);
+        let qualified_rel_source_key = format!("{}__{}", rel_instance.alias, source_key);
+
+        LogicalPlanBuilder::from(input_plan)
+            .join(
+                rel_scan,
+                JoinType::Inner,
+                (vec![qualified_source_key], vec![qualified_rel_source_key]),
+                None,
+            )
+            .map_err(|e| crate::error::GraphError::PlanError {
+                message: format!("Failed to join with relationship: {}", e),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            })
+    }
+
+    /// Build a qualified target node scan with property filters
+    fn build_qualified_target_scan(
+        &self,
+        catalog: &Arc<dyn GraphSourceCatalog>,
+        target_label: &str,
+        target_variable: &str,
+        target_properties: &HashMap<String, crate::ast::PropertyValue>,
+    ) -> Result<LogicalPlan> {
+        let target_source = catalog.node_source(target_label).ok_or_else(|| {
+            crate::error::GraphError::ConfigError {
+                message: format!("No table source found for node label: {}", target_label),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            }
+        })?;
+
+        let target_schema = target_source.schema();
+        let mut target_builder = LogicalPlanBuilder::scan(target_label, target_source, None)
+            .map_err(|e| crate::error::GraphError::PlanError {
+                message: format!("Failed to scan target node: {}", e),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            })?;
+
+        // Apply target property filters
+        for (k, v) in target_properties.iter() {
+            let lit_expr = self.to_df_value_expr(&crate::ast::ValueExpression::Literal(v.clone()));
+            let filter_expr = Expr::BinaryExpr(BinaryExpr {
+                left: Box::new(col(k)),
+                op: Operator::Eq,
+                right: Box::new(lit_expr),
+            });
+            target_builder = target_builder.filter(filter_expr).map_err(|e| {
+                crate::error::GraphError::PlanError {
+                    message: format!("Failed to apply target property filter: {}", e),
+                    location: snafu::Location::new(file!(), line!(), column!()),
+                }
+            })?;
+        }
+
+        let target_qualified_exprs: Vec<Expr> = target_schema
+            .fields()
+            .iter()
+            .map(|field| {
+                let qualified_name = format!("{}__{}", target_variable, field.name());
+                col(field.name()).alias(&qualified_name)
+            })
+            .collect();
+
+        target_builder
+            .project(target_qualified_exprs)
+            .map_err(|e| crate::error::GraphError::PlanError {
+                message: format!("Failed to project target node: {}", e),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            })?
+            .build()
+            .map_err(|e| crate::error::GraphError::PlanError {
+                message: format!("Failed to build target scan: {}", e),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            })
+    }
+
+    /// Join builder with target node scan
+    #[allow(clippy::too_many_arguments)]
+    fn join_target_to_builder(
+        &self,
+        builder: LogicalPlanBuilder,
+        target_scan: LogicalPlan,
+        target_variable: &str,
+        rel_instance: &RelationshipInstance,
+        rel_map: &crate::config::RelationshipMapping,
+        node_map: &crate::config::NodeMapping,
+        direction: &RelationshipDirection,
+    ) -> Result<LogicalPlanBuilder> {
+        let target_key = Self::get_target_join_key(direction, rel_map);
+        let qualified_rel_target_key = format!("{}__{}", rel_instance.alias, target_key);
+        let qualified_target_key = format!("{}__{}", target_variable, &node_map.id_field);
+
+        builder
+            .join(
+                target_scan,
+                JoinType::Inner,
+                (vec![qualified_rel_target_key], vec![qualified_target_key]),
+                None,
+            )
+            .map_err(|e| crate::error::GraphError::PlanError {
+                message: format!("Failed to join with target node: {}", e),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            })
     }
 
     // ============================================================================
@@ -901,10 +1510,12 @@ mod tests {
             input: Box::new(scan_a),
             source_variable: "a".to_string(),
             target_variable: "b".to_string(),
+            target_label: "Person".to_string(),
             relationship_types: vec!["KNOWS".to_string()],
             direction: crate::ast::RelationshipDirection::Outgoing,
             relationship_variable: None,
             properties: Default::default(),
+            target_properties: Default::default(),
         };
         let project = LogicalOperator::Project {
             input: Box::new(expand),
@@ -990,10 +1601,12 @@ mod tests {
             input: Box::new(scan_a),
             source_variable: "a".to_string(),
             target_variable: "b".to_string(),
+            target_label: "Person".to_string(),
             relationship_types: vec!["KNOWS".to_string()],
             direction: crate::ast::RelationshipDirection::Outgoing,
             relationship_variable: None,
             properties: Default::default(),
+            target_properties: Default::default(),
         };
         let project = LogicalOperator::Project {
             input: Box::new(expand),
@@ -1038,10 +1651,12 @@ mod tests {
             input: Box::new(scan_a),
             source_variable: "a".to_string(),
             target_variable: "b".to_string(),
+            target_label: "Person".to_string(),
             relationship_types: vec!["KNOWS".to_string()],
             direction: crate::ast::RelationshipDirection::Outgoing,
             relationship_variable: Some("r".to_string()),
             properties: Default::default(),
+            target_properties: Default::default(),
         };
         let project = LogicalOperator::Project {
             input: Box::new(expand),
@@ -1081,10 +1696,12 @@ mod tests {
             input: Box::new(scan_a),
             source_variable: "a".to_string(),
             target_variable: "b".to_string(),
+            target_label: "Person".to_string(),
             relationship_types: vec!["KNOWS".to_string()],
             direction: crate::ast::RelationshipDirection::Outgoing,
             relationship_variable: Some("r".to_string()),
             properties: Default::default(),
+            target_properties: Default::default(),
         };
         let filter = LogicalOperator::Filter {
             input: Box::new(expand),
@@ -1136,10 +1753,12 @@ mod tests {
             input: Box::new(scan_a),
             source_variable: "a".to_string(),
             target_variable: "b".to_string(),
+            target_label: "Person".to_string(),
             relationship_types: vec!["KNOWS".to_string()],
             direction: crate::ast::RelationshipDirection::Outgoing,
             relationship_variable: Some("r".to_string()),
             properties: Default::default(),
+            target_properties: Default::default(),
         };
         let pred = BooleanExpression::Exists(PropertyRef {
             variable: "r".into(),
@@ -1177,10 +1796,12 @@ mod tests {
             input: Box::new(scan_a),
             source_variable: "a".to_string(),
             target_variable: "b".to_string(),
+            target_label: "Person".to_string(),
             relationship_types: vec!["KNOWS".to_string()],
             direction: crate::ast::RelationshipDirection::Outgoing,
             relationship_variable: Some("r".to_string()),
             properties: Default::default(),
+            target_properties: Default::default(),
         };
         let filter = LogicalOperator::Filter {
             input: Box::new(expand),
@@ -1223,10 +1844,12 @@ mod tests {
             input: Box::new(scan_a),
             source_variable: "a".to_string(),
             target_variable: "b".to_string(),
+            target_label: "Person".to_string(),
             relationship_types: vec!["KNOWS".to_string()],
             direction: crate::ast::RelationshipDirection::Incoming,
             relationship_variable: None,
             properties: Default::default(),
+            target_properties: Default::default(),
         };
         let project = LogicalOperator::Project {
             input: Box::new(expand),
@@ -1265,10 +1888,12 @@ mod tests {
             input: Box::new(scan_a),
             source_variable: "a".to_string(),
             target_variable: "b".to_string(),
+            target_label: "Person".to_string(),
             relationship_types: vec!["KNOWS".to_string()],
             direction: crate::ast::RelationshipDirection::Undirected,
             relationship_variable: None,
             properties: Default::default(),
+            target_properties: Default::default(),
         };
         let project = LogicalOperator::Project {
             input: Box::new(expand),
@@ -1373,10 +1998,12 @@ mod tests {
             input: Box::new(scan_a),
             source_variable: "a".into(),
             target_variable: "b".into(),
+            target_label: "Person".into(),
             relationship_types: vec!["KNOWS".into()],
             direction: crate::ast::RelationshipDirection::Outgoing,
             relationship_variable: Some("r".into()),
             properties: Default::default(),
+            target_properties: Default::default(),
         };
         let pred = BooleanExpression::And(
             Box::new(BooleanExpression::Comparison {
@@ -1486,6 +2113,7 @@ mod tests {
             relationship_variable: Some("r".into()),
             min_length: Some(1),
             max_length: Some(2),
+            target_properties: HashMap::new(),
         };
         let project = LogicalOperator::Project {
             input: Box::new(vlexpand),
@@ -1513,6 +2141,360 @@ mod tests {
     }
 
     #[test]
+    fn test_varlength_expand_single_hop() {
+        // MATCH (a:Person)-[:KNOWS*1..1]->(b:Person) - equivalent to single hop
+        let scan_a = LogicalOperator::ScanByLabel {
+            variable: "a".into(),
+            label: "Person".into(),
+            properties: Default::default(),
+        };
+        let vlexpand = LogicalOperator::VariableLengthExpand {
+            input: Box::new(scan_a),
+            source_variable: "a".into(),
+            target_variable: "b".into(),
+            relationship_types: vec!["KNOWS".into()],
+            direction: crate::ast::RelationshipDirection::Outgoing,
+            relationship_variable: None,
+            min_length: Some(1),
+            max_length: Some(1),
+            target_properties: HashMap::new(),
+        };
+        let project = LogicalOperator::Project {
+            input: Box::new(vlexpand),
+            projections: vec![ProjectionItem {
+                expression: ValueExpression::Property(PropertyRef {
+                    variable: "b".into(),
+                    property: "name".into(),
+                }),
+                alias: None,
+            }],
+        };
+        let cfg = crate::config::GraphConfig::builder()
+            .with_node_label("Person", "id")
+            .with_relationship("KNOWS", "src_person_id", "dst_person_id")
+            .build()
+            .unwrap();
+        let planner = DataFusionPlanner::with_catalog(cfg, make_catalog());
+        let df_plan = planner.plan(&project).unwrap();
+        let s = format!("{:?}", df_plan);
+
+        // Should have joins but no UNION (only 1 hop)
+        assert!(s.contains("Join("));
+        // Single hop shouldn't have Union
+        assert!(!s.contains("Union"));
+    }
+
+    #[test]
+    fn test_varlength_expand_with_union() {
+        // MATCH (a:Person)-[:KNOWS*2..3]->(b:Person) - should have UNION
+        let scan_a = LogicalOperator::ScanByLabel {
+            variable: "a".into(),
+            label: "Person".into(),
+            properties: Default::default(),
+        };
+        let vlexpand = LogicalOperator::VariableLengthExpand {
+            input: Box::new(scan_a),
+            source_variable: "a".into(),
+            target_variable: "b".into(),
+            relationship_types: vec!["KNOWS".into()],
+            direction: crate::ast::RelationshipDirection::Outgoing,
+            relationship_variable: None,
+            min_length: Some(2),
+            max_length: Some(3),
+            target_properties: HashMap::new(),
+        };
+        let project = LogicalOperator::Project {
+            input: Box::new(vlexpand),
+            projections: vec![ProjectionItem {
+                expression: ValueExpression::Property(PropertyRef {
+                    variable: "b".into(),
+                    property: "name".into(),
+                }),
+                alias: None,
+            }],
+        };
+        let cfg = crate::config::GraphConfig::builder()
+            .with_node_label("Person", "id")
+            .with_relationship("KNOWS", "src_person_id", "dst_person_id")
+            .build()
+            .unwrap();
+        let planner = DataFusionPlanner::with_catalog(cfg, make_catalog());
+        let df_plan = planner.plan(&project).unwrap();
+        let s = format!("{:?}", df_plan);
+
+        // Should have UNION for multiple hop counts
+        assert!(s.contains("Union") || s.contains("union"));
+        assert!(s.contains("Join("));
+    }
+
+    #[test]
+    fn test_varlength_expand_default_min() {
+        // MATCH (a:Person)-[:KNOWS*..3]->(b:Person) - min defaults to 1
+        let scan_a = LogicalOperator::ScanByLabel {
+            variable: "a".into(),
+            label: "Person".into(),
+            properties: Default::default(),
+        };
+        let vlexpand = LogicalOperator::VariableLengthExpand {
+            input: Box::new(scan_a),
+            source_variable: "a".into(),
+            target_variable: "b".into(),
+            relationship_types: vec!["KNOWS".into()],
+            direction: crate::ast::RelationshipDirection::Outgoing,
+            relationship_variable: None,
+            min_length: None, // Should default to 1
+            max_length: Some(3),
+            target_properties: HashMap::new(),
+        };
+        let project = LogicalOperator::Project {
+            input: Box::new(vlexpand),
+            projections: vec![ProjectionItem {
+                expression: ValueExpression::Property(PropertyRef {
+                    variable: "b".into(),
+                    property: "name".into(),
+                }),
+                alias: None,
+            }],
+        };
+        let cfg = crate::config::GraphConfig::builder()
+            .with_node_label("Person", "id")
+            .with_relationship("KNOWS", "src_person_id", "dst_person_id")
+            .build()
+            .unwrap();
+        let planner = DataFusionPlanner::with_catalog(cfg, make_catalog());
+        let df_plan = planner.plan(&project).unwrap();
+        let s = format!("{:?}", df_plan);
+
+        // Should build successfully with default min
+        assert!(s.contains("Join("));
+    }
+
+    #[test]
+    fn test_varlength_expand_default_max() {
+        // MATCH (a:Person)-[:KNOWS*2..]->(b:Person) - max defaults to 20
+        let scan_a = LogicalOperator::ScanByLabel {
+            variable: "a".into(),
+            label: "Person".into(),
+            properties: Default::default(),
+        };
+        let vlexpand = LogicalOperator::VariableLengthExpand {
+            input: Box::new(scan_a),
+            source_variable: "a".into(),
+            target_variable: "b".into(),
+            relationship_types: vec!["KNOWS".into()],
+            direction: crate::ast::RelationshipDirection::Outgoing,
+            relationship_variable: None,
+            min_length: Some(2),
+            max_length: None, // Should default to MAX_VARIABLE_LENGTH_HOPS (20)
+            target_properties: HashMap::new(),
+        };
+        let project = LogicalOperator::Project {
+            input: Box::new(vlexpand),
+            projections: vec![ProjectionItem {
+                expression: ValueExpression::Property(PropertyRef {
+                    variable: "b".into(),
+                    property: "name".into(),
+                }),
+                alias: None,
+            }],
+        };
+        let cfg = crate::config::GraphConfig::builder()
+            .with_node_label("Person", "id")
+            .with_relationship("KNOWS", "src_person_id", "dst_person_id")
+            .build()
+            .unwrap();
+        let planner = DataFusionPlanner::with_catalog(cfg, make_catalog());
+        let df_plan = planner.plan(&project).unwrap();
+        let s = format!("{:?}", df_plan);
+
+        // Should build successfully with default max
+        assert!(s.contains("Union") || s.contains("union"));
+        assert!(s.contains("Join("));
+    }
+
+    #[test]
+    fn test_varlength_expand_invalid_range() {
+        // MATCH (a:Person)-[:KNOWS*3..2]->(b:Person) - min > max should error
+        let scan_a = LogicalOperator::ScanByLabel {
+            variable: "a".into(),
+            label: "Person".into(),
+            properties: Default::default(),
+        };
+        let vlexpand = LogicalOperator::VariableLengthExpand {
+            input: Box::new(scan_a),
+            source_variable: "a".into(),
+            target_variable: "b".into(),
+            relationship_types: vec!["KNOWS".into()],
+            direction: crate::ast::RelationshipDirection::Outgoing,
+            relationship_variable: None,
+            min_length: Some(3),
+            max_length: Some(2), // Invalid: min > max
+            target_properties: HashMap::new(),
+        };
+        let project = LogicalOperator::Project {
+            input: Box::new(vlexpand),
+            projections: vec![ProjectionItem {
+                expression: ValueExpression::Property(PropertyRef {
+                    variable: "b".into(),
+                    property: "name".into(),
+                }),
+                alias: None,
+            }],
+        };
+        let cfg = crate::config::GraphConfig::builder()
+            .with_node_label("Person", "id")
+            .with_relationship("KNOWS", "src_person_id", "dst_person_id")
+            .build()
+            .unwrap();
+        let planner = DataFusionPlanner::with_catalog(cfg, make_catalog());
+        let result = planner.plan(&project);
+
+        // Should return error
+        assert!(result.is_err());
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(err_msg.contains("Invalid variable-length range"));
+    }
+
+    #[test]
+    fn test_varlength_expand_exceeds_max() {
+        // MATCH (a:Person)-[:KNOWS*1..25]->(b:Person) - exceeds MAX (20)
+        let scan_a = LogicalOperator::ScanByLabel {
+            variable: "a".into(),
+            label: "Person".into(),
+            properties: Default::default(),
+        };
+        let vlexpand = LogicalOperator::VariableLengthExpand {
+            input: Box::new(scan_a),
+            source_variable: "a".into(),
+            target_variable: "b".into(),
+            relationship_types: vec!["KNOWS".into()],
+            direction: crate::ast::RelationshipDirection::Outgoing,
+            relationship_variable: None,
+            min_length: Some(1),
+            max_length: Some(25), // Exceeds MAX_VARIABLE_LENGTH_HOPS
+            target_properties: HashMap::new(),
+        };
+        let project = LogicalOperator::Project {
+            input: Box::new(vlexpand),
+            projections: vec![ProjectionItem {
+                expression: ValueExpression::Property(PropertyRef {
+                    variable: "b".into(),
+                    property: "name".into(),
+                }),
+                alias: None,
+            }],
+        };
+        let cfg = crate::config::GraphConfig::builder()
+            .with_node_label("Person", "id")
+            .with_relationship("KNOWS", "src_person_id", "dst_person_id")
+            .build()
+            .unwrap();
+        let planner = DataFusionPlanner::with_catalog(cfg, make_catalog());
+        let result = planner.plan(&project);
+
+        // Should return error
+        assert!(result.is_err());
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(err_msg.contains("Variable-length paths with max length > 20"));
+    }
+
+    #[test]
+    fn test_varlength_expand_with_filter() {
+        // MATCH (a:Person)-[:KNOWS*1..2]->(b:Person) WHERE b.age > 30 RETURN b.name
+        let scan_a = LogicalOperator::ScanByLabel {
+            variable: "a".into(),
+            label: "Person".into(),
+            properties: Default::default(),
+        };
+        let vlexpand = LogicalOperator::VariableLengthExpand {
+            input: Box::new(scan_a),
+            source_variable: "a".into(),
+            target_variable: "b".into(),
+            relationship_types: vec!["KNOWS".into()],
+            direction: crate::ast::RelationshipDirection::Outgoing,
+            relationship_variable: None,
+            min_length: Some(1),
+            max_length: Some(2),
+            target_properties: HashMap::new(),
+        };
+        let filter = LogicalOperator::Filter {
+            input: Box::new(vlexpand),
+            predicate: BooleanExpression::Comparison {
+                left: ValueExpression::Property(PropertyRef {
+                    variable: "b".into(),
+                    property: "age".into(),
+                }),
+                operator: ComparisonOperator::GreaterThan,
+                right: ValueExpression::Literal(PropertyValue::Integer(30)),
+            },
+        };
+        let project = LogicalOperator::Project {
+            input: Box::new(filter),
+            projections: vec![ProjectionItem {
+                expression: ValueExpression::Property(PropertyRef {
+                    variable: "b".into(),
+                    property: "name".into(),
+                }),
+                alias: None,
+            }],
+        };
+        let cfg = crate::config::GraphConfig::builder()
+            .with_node_label("Person", "id")
+            .with_relationship("KNOWS", "src_person_id", "dst_person_id")
+            .build()
+            .unwrap();
+        let planner = DataFusionPlanner::with_catalog(cfg, make_catalog());
+        let df_plan = planner.plan(&project).unwrap();
+        let s = format!("{:?}", df_plan);
+
+        // Should have filter and joins
+        assert!(s.contains("Filter") || s.contains("filter"));
+        assert!(s.contains("Join("));
+    }
+
+    #[test]
+    fn test_varlength_expand_analysis_registers_instances() {
+        // Test that analysis phase correctly registers multiple relationship instances
+        let scan_a = LogicalOperator::ScanByLabel {
+            variable: "a".into(),
+            label: "Person".into(),
+            properties: Default::default(),
+        };
+        let vlexpand = LogicalOperator::VariableLengthExpand {
+            input: Box::new(scan_a),
+            source_variable: "a".into(),
+            target_variable: "b".into(),
+            relationship_types: vec!["KNOWS".into()],
+            direction: crate::ast::RelationshipDirection::Outgoing,
+            relationship_variable: None,
+            min_length: Some(1),
+            max_length: Some(2),
+            target_properties: HashMap::new(),
+        };
+
+        let cfg = crate::config::GraphConfig::builder()
+            .with_node_label("Person", "id")
+            .with_relationship("KNOWS", "src_person_id", "dst_person_id")
+            .build()
+            .unwrap();
+        let planner = DataFusionPlanner::new(cfg);
+        let analysis = planner.analyze(&vlexpand).unwrap();
+
+        // For *1..2, should register 1 + 2 = 3 instances
+        let knows_instances: Vec<_> = analysis
+            .relationship_instances
+            .iter()
+            .filter(|r| r.rel_type == "KNOWS")
+            .collect();
+
+        assert_eq!(
+            knows_instances.len(),
+            3,
+            "Should register 3 KNOWS instances for *1..2"
+        );
+    }
+
+    #[test]
     fn test_query_analysis_single_hop() {
         // Test that analysis correctly identifies relationship instances
         let scan_a = LogicalOperator::ScanByLabel {
@@ -1524,10 +2506,12 @@ mod tests {
             input: Box::new(scan_a),
             source_variable: "a".into(),
             target_variable: "b".into(),
+            target_label: "Person".into(),
             relationship_types: vec!["KNOWS".into()],
             direction: crate::ast::RelationshipDirection::Outgoing,
             relationship_variable: None,
             properties: Default::default(),
+            target_properties: Default::default(),
         };
 
         let cfg = crate::config::GraphConfig::builder()
@@ -1562,19 +2546,23 @@ mod tests {
             input: Box::new(scan_a),
             source_variable: "a".into(),
             target_variable: "b".into(),
+            target_label: "Person".into(),
             relationship_types: vec!["KNOWS".into()],
             direction: crate::ast::RelationshipDirection::Outgoing,
             relationship_variable: None,
             properties: Default::default(),
+            target_properties: Default::default(),
         };
         let expand2 = LogicalOperator::Expand {
             input: Box::new(expand1),
             source_variable: "b".into(),
             target_variable: "c".into(),
+            target_label: "Person".into(),
             relationship_types: vec!["KNOWS".into()],
             direction: crate::ast::RelationshipDirection::Outgoing,
             relationship_variable: None,
             properties: Default::default(),
+            target_properties: Default::default(),
         };
 
         let cfg = crate::config::GraphConfig::builder()

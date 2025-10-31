@@ -55,6 +55,7 @@ impl<'a> LogicalPlanToSqlConverter<'a> {
                 direction,
                 relationship_variable,
                 properties,
+                ..
             } => self.convert_expand(
                 input,
                 source_variable,
