@@ -57,7 +57,7 @@ pub enum LogicalOperator {
     /// Variable-length path expansion (*1..2 syntax)
     ///
     /// Represents multi-hop relationship traversals: (source)-[rel*min..max]->(target)
-    /// This is implemented by unrolling into multiple fixed-length paths and UNIONing them
+    /// This is implemented by unrolling into multiple fixed-length paths and unioning them
     VariableLengthExpand {
         /// The input operator (typically a node scan)
         input: Box<LogicalOperator>,
