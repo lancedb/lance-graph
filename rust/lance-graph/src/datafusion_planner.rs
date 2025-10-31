@@ -52,6 +52,18 @@ impl DataFusionPlanner {
             catalog: Some(catalog),
         }
     }
+
+    /// Helper to convert DataFusion builder errors into GraphError::PlanError with context
+    fn plan_error<E: std::fmt::Display>(
+        &self,
+        context: &str,
+        error: E,
+    ) -> crate::error::GraphError {
+        crate::error::GraphError::PlanError {
+            message: format!("{}: {}", context, error),
+            location: snafu::Location::new(file!(), line!(), column!()),
+        }
+    }
 }
 
 // ============================================================================
@@ -348,11 +360,11 @@ impl DataFusionPlanner {
             LogicalOperator::Filter { input, predicate } => {
                 let input_plan = self.build_operator(ctx, input)?;
                 let expr = self.to_df_boolean_expr(predicate);
-                Ok(LogicalPlanBuilder::from(input_plan)
+                LogicalPlanBuilder::from(input_plan)
                     .filter(expr)
-                    .unwrap()
+                    .map_err(|e| self.plan_error("Failed to build filter", e))?
                     .build()
-                    .unwrap())
+                    .map_err(|e| self.plan_error("Failed to build plan", e))
             }
             LogicalOperator::Project { input, projections } => {
                 let input_plan = self.build_operator(ctx, input)?;
@@ -368,19 +380,19 @@ impl DataFusionPlanner {
                         }
                     })
                     .collect();
-                Ok(LogicalPlanBuilder::from(input_plan)
+                LogicalPlanBuilder::from(input_plan)
                     .project(exprs)
-                    .unwrap()
+                    .map_err(|e| self.plan_error("Failed to build projection", e))?
                     .build()
-                    .unwrap())
+                    .map_err(|e| self.plan_error("Failed to build plan", e))
             }
             LogicalOperator::Distinct { input } => {
                 let input_plan = self.build_operator(ctx, input)?;
-                Ok(LogicalPlanBuilder::from(input_plan)
+                LogicalPlanBuilder::from(input_plan)
                     .distinct()
-                    .unwrap()
+                    .map_err(|e| self.plan_error("Failed to build distinct", e))?
                     .build()
-                    .unwrap())
+                    .map_err(|e| self.plan_error("Failed to build plan", e))
             }
             LogicalOperator::Sort { input, sort_items } => {
                 use datafusion::logical_expr::SortExpr;
@@ -401,27 +413,27 @@ impl DataFusionPlanner {
                     })
                     .collect();
 
-                Ok(LogicalPlanBuilder::from(input_plan)
+                LogicalPlanBuilder::from(input_plan)
                     .sort(sort_exprs)
-                    .unwrap()
+                    .map_err(|e| self.plan_error("Failed to build sort", e))?
                     .build()
-                    .unwrap())
+                    .map_err(|e| self.plan_error("Failed to build plan", e))
             }
             LogicalOperator::Limit { input, count } => {
                 let input_plan = self.build_operator(ctx, input)?;
-                Ok(LogicalPlanBuilder::from(input_plan)
+                LogicalPlanBuilder::from(input_plan)
                     .limit(0, Some((*count) as usize))
-                    .unwrap()
+                    .map_err(|e| self.plan_error("Failed to build limit", e))?
                     .build()
-                    .unwrap())
+                    .map_err(|e| self.plan_error("Failed to build plan", e))
             }
             LogicalOperator::Offset { input, offset } => {
                 let input_plan = self.build_operator(ctx, input)?;
-                Ok(LogicalPlanBuilder::from(input_plan)
+                LogicalPlanBuilder::from(input_plan)
                     .limit((*offset) as usize, None)
-                    .unwrap()
+                    .map_err(|e| self.plan_error("Failed to build offset", e))?
                     .build()
-                    .unwrap())
+                    .map_err(|e| self.plan_error("Failed to build plan", e))
             }
             LogicalOperator::Expand {
                 input,
@@ -486,10 +498,13 @@ impl DataFusionPlanner {
     ) -> Result<LogicalPlan> {
         // Try to use catalog if available
         if let Some(cat) = &self.catalog {
+            // Catalog exists - check if label is registered
             if let Some(source) = cat.node_source(label) {
                 // Get schema before moving source
                 let schema = source.schema();
-                let mut builder = LogicalPlanBuilder::scan(label, source, None).unwrap();
+                let mut builder = LogicalPlanBuilder::scan(label, source, None).map_err(|e| {
+                    self.plan_error(&format!("Failed to scan node source '{}'", label), e)
+                })?;
 
                 // Apply property filters using unqualified names (before aliasing)
                 for (k, v) in properties.iter() {
@@ -500,7 +515,9 @@ impl DataFusionPlanner {
                         op: Operator::Eq,
                         right: Box::new(lit_expr),
                     });
-                    builder = builder.filter(filter_expr).unwrap();
+                    builder = builder.filter(filter_expr).map_err(|e| {
+                        self.plan_error(&format!("Failed to apply filter on property '{}'", k), e)
+                    })?;
                 }
 
                 // Create qualified column aliases: variable__property
@@ -514,27 +531,37 @@ impl DataFusionPlanner {
                     .collect();
 
                 // Add projection with qualified aliases
-                builder = builder.project(qualified_exprs).unwrap();
+                builder = builder
+                    .project(qualified_exprs)
+                    .map_err(|e| self.plan_error("Failed to project qualified columns", e))?;
 
-                return Ok(builder.build().unwrap());
+                return builder
+                    .build()
+                    .map_err(|e| self.plan_error("Failed to build scan plan", e));
+            } else {
+                // Catalog exists but label not found - fail fast
+                return Err(crate::error::GraphError::ConfigError {
+                    message: format!(
+                        "Node label '{}' not found in catalog. \
+                         Ensure the label is registered in your GraphConfig with .with_node_label()",
+                        label
+                    ),
+                    location: snafu::Location::new(file!(), line!(), column!()),
+                });
             }
         }
 
-        // Fallback: create a simple table reference that DataFusion can resolve at execution time
+        // No catalog attached - create empty source fallback for flexibility
+        // This allows planners created with DataFusionPlanner::new() to work
+        // without requiring a catalog, though they won't have actual data sources
         let empty_source = Arc::new(crate::source_catalog::SimpleTableSource::empty());
         let builder = LogicalPlanBuilder::scan(label, empty_source, None).map_err(|e| {
-            crate::error::GraphError::PlanError {
-                message: format!("Failed to create table scan for {}: {}", label, e),
-                location: snafu::Location::new(file!(), line!(), column!()),
-            }
+            self.plan_error(&format!("Failed to create table scan for '{}'", label), e)
         })?;
 
         builder
             .build()
-            .map_err(|e| crate::error::GraphError::PlanError {
-                message: format!("Failed to build table scan for {}: {}", label, e),
-                location: snafu::Location::new(file!(), line!(), column!()),
-            })
+            .map_err(|e| self.plan_error("Failed to build scan plan", e))
     }
 
     /// Build a relationship expansion (graph traversal) as a series of joins
@@ -621,8 +648,13 @@ impl DataFusionPlanner {
         relationship_properties: &HashMap<String, crate::ast::PropertyValue>,
     ) -> Result<LogicalPlan> {
         let rel_schema = rel_source.schema();
-        let mut rel_builder =
-            LogicalPlanBuilder::scan(&rel_instance.rel_type, rel_source, None).unwrap();
+        let mut rel_builder = LogicalPlanBuilder::scan(&rel_instance.rel_type, rel_source, None)
+            .map_err(|e| {
+                self.plan_error(
+                    &format!("Failed to scan relationship '{}'", rel_instance.rel_type),
+                    e,
+                )
+            })?;
 
         // Apply relationship property filters (e.g., -[r {since: 2020}]->)
         for (k, v) in relationship_properties.iter() {
@@ -632,7 +664,12 @@ impl DataFusionPlanner {
                 op: Operator::Eq,
                 right: Box::new(lit_expr),
             });
-            rel_builder = rel_builder.filter(filter_expr).unwrap();
+            rel_builder = rel_builder.filter(filter_expr).map_err(|e| {
+                self.plan_error(
+                    &format!("Failed to apply relationship filter on '{}'", k),
+                    e,
+                )
+            })?;
         }
 
         // Use unique alias from rel_instance to avoid column conflicts
@@ -645,11 +682,11 @@ impl DataFusionPlanner {
             })
             .collect();
 
-        Ok(rel_builder
+        rel_builder
             .project(rel_qualified_exprs)
-            .unwrap()
+            .map_err(|e| self.plan_error("Failed to project relationship columns", e))?
             .build()
-            .unwrap())
+            .map_err(|e| self.plan_error("Failed to build relationship scan", e))
     }
 
     /// Join source node plan with relationship scan
@@ -669,14 +706,14 @@ impl DataFusionPlanner {
         let qualified_left_key = format!("{}__{}", params.source_variable, params.node_id_field);
         let qualified_right_key = format!("{}__{}", params.rel_qualifier, right_key);
 
-        Ok(LogicalPlanBuilder::from(left_plan)
+        LogicalPlanBuilder::from(left_plan)
             .join(
                 rel_scan,
                 JoinType::Inner,
                 (vec![qualified_left_key], vec![qualified_right_key]),
                 None,
             )
-            .unwrap())
+            .map_err(|e| self.plan_error("Failed to join source to relationship", e))
     }
 
     /// Join relationship with target node scan
@@ -694,17 +731,23 @@ impl DataFusionPlanner {
             .get(params.target_variable)
             .cloned()
         else {
-            return Ok(builder.build().unwrap());
+            return builder
+                .build()
+                .map_err(|e| self.plan_error("Failed to build plan (no target label)", e));
         };
 
         let Some(target_source) = cat.node_source(&target_label) else {
-            return Ok(builder.build().unwrap());
+            return builder
+                .build()
+                .map_err(|e| self.plan_error("Failed to build plan (no target source)", e));
         };
 
         // Create target node scan with qualified column aliases and property filters
         let target_schema = target_source.schema();
-        let mut target_builder =
-            LogicalPlanBuilder::scan(&target_label, target_source, None).unwrap();
+        let mut target_builder = LogicalPlanBuilder::scan(&target_label, target_source, None)
+            .map_err(|e| {
+                self.plan_error(&format!("Failed to scan target node '{}'", target_label), e)
+            })?;
 
         // Apply target property filters (e.g., (b {age: 30}))
         for (k, v) in params.target_properties.iter() {
@@ -714,7 +757,9 @@ impl DataFusionPlanner {
                 op: Operator::Eq,
                 right: Box::new(lit_expr),
             });
-            target_builder = target_builder.filter(filter_expr).unwrap();
+            target_builder = target_builder.filter(filter_expr).map_err(|e| {
+                self.plan_error(&format!("Failed to apply target filter on '{}'", k), e)
+            })?;
         }
 
         let target_qualified_exprs: Vec<Expr> = target_schema
@@ -728,9 +773,9 @@ impl DataFusionPlanner {
 
         let target_scan = target_builder
             .project(target_qualified_exprs)
-            .unwrap()
+            .map_err(|e| self.plan_error("Failed to project target columns", e))?
             .build()
-            .unwrap();
+            .map_err(|e| self.plan_error("Failed to build target scan", e))?;
 
         // Determine target join keys
         let target_key = match params.direction {
@@ -750,9 +795,11 @@ impl DataFusionPlanner {
                 (vec![qualified_rel_target_key], vec![qualified_target_key]),
                 None,
             )
-            .unwrap();
+            .map_err(|e| self.plan_error("Failed to join relationship to target", e))?;
 
-        Ok(builder.build().unwrap())
+        builder
+            .build()
+            .map_err(|e| self.plan_error("Failed to build final join plan", e))
     }
 
     /// Get the expected qualified column names for variable-length path results
@@ -1049,19 +1096,53 @@ impl DataFusionPlanner {
         ctx: &PlanningContext,
         target_variable: &str,
     ) -> Result<(String, &crate::config::NodeMapping)> {
-        let target_label = ctx
-            .analysis
-            .var_to_label
-            .get(target_variable)
-            .or_else(|| self.config.node_mappings.keys().next())
-            .ok_or_else(|| crate::error::GraphError::ConfigError {
+        // Try to get label from analysis first
+        let target_label = if let Some(label) = ctx.analysis.var_to_label.get(target_variable) {
+            label.clone()
+        } else if target_variable.starts_with("_temp_") {
+            // For temporary variables in multi-hop paths (e.g., "_temp_a_1" or "_temp_foo_bar_1"),
+            // infer the label from the source variable by extracting the base name
+            // Format: _temp_{source}_{hop_index}
+            // Note: source can contain underscores, so we reconstruct it from all parts
+            // between the _temp prefix and the final hop index
+            let parts: Vec<&str> = target_variable.split('_').collect();
+            if parts.len() >= 4 {
+                // parts[0] = "", parts[1] = "temp", parts[2..len-1] = source variable parts, parts[len-1] = hop index
+                let source_var = parts[2..parts.len() - 1].join("_");
+                ctx.analysis
+                    .var_to_label
+                    .get(&source_var)
+                    .ok_or_else(|| crate::error::GraphError::ConfigError {
+                        message: format!(
+                            "Cannot infer label for temporary variable '{}' \
+                             from source variable '{}'",
+                            target_variable, source_var
+                        ),
+                        location: snafu::Location::new(file!(), line!(), column!()),
+                    })?
+                    .clone()
+            } else {
+                return Err(crate::error::GraphError::ConfigError {
+                    message: format!(
+                        "Invalid temporary variable format: '{}'. \
+                         Expected format: _temp_{{source}}_{{index}}",
+                        target_variable
+                    ),
+                    location: snafu::Location::new(file!(), line!(), column!()),
+                });
+            }
+        } else {
+            // Not in analysis and not a temp variable - this is an error
+            return Err(crate::error::GraphError::ConfigError {
                 message: format!(
-                    "Cannot infer target label for variable: {}",
+                    "Cannot determine target node label for variable '{}'. \
+                     This variable was not found in the query analysis. \
+                     Ensure the query properly defines this node variable.",
                     target_variable
                 ),
                 location: snafu::Location::new(file!(), line!(), column!()),
-            })?
-            .clone();
+            });
+        };
 
         let node_map = self
             .config
@@ -2920,5 +3001,272 @@ mod tests {
         // Should contain the alias and the qualified name
         assert!(s.contains("full_name"));
         assert!(s.contains("p__age"));
+    }
+
+    #[test]
+    fn test_temp_variable_with_underscores_in_source() {
+        // Test that temporary variables work correctly when source variable contains underscores
+        let cfg = crate::config::GraphConfig::builder()
+            .with_node_label("Person", "id")
+            .with_relationship("KNOWS", "src_person_id", "dst_person_id")
+            .build()
+            .unwrap();
+        let planner = DataFusionPlanner::with_catalog(cfg, make_catalog());
+
+        // Create a scan with a variable name containing underscores
+        let scan = LogicalOperator::ScanByLabel {
+            variable: "foo_bar".to_string(), // Variable with underscores
+            label: "Person".to_string(),
+            properties: Default::default(),
+        };
+
+        let var_expand = LogicalOperator::VariableLengthExpand {
+            input: Box::new(scan),
+            source_variable: "foo_bar".to_string(), // Will generate _temp_foo_bar_1
+            target_variable: "baz".to_string(),
+            relationship_types: vec!["KNOWS".to_string()],
+            direction: crate::ast::RelationshipDirection::Outgoing,
+            min_length: Some(2),
+            max_length: Some(2),
+            relationship_variable: None,
+            target_properties: Default::default(),
+        };
+
+        let result = planner.plan(&var_expand);
+
+        // Should succeed - the temp variable parsing should handle underscores correctly
+        assert!(
+            result.is_ok(),
+            "Should handle source variables with underscores: {:?}",
+            result.err()
+        );
+    }
+
+    // ========================================================================
+    // Failure Scenario Tests
+    // ========================================================================
+
+    #[test]
+    fn test_scan_missing_node_label_with_catalog_fails_fast() {
+        // Test that when a catalog is attached, scanning a non-existent label fails fast
+        // This catches typos and configuration issues at planning time
+        let cfg = crate::config::GraphConfig::builder()
+            .with_node_label("Person", "id")
+            .build()
+            .unwrap();
+        let planner = DataFusionPlanner::with_catalog(cfg, make_catalog());
+
+        let scan = LogicalOperator::ScanByLabel {
+            variable: "x".to_string(),
+            label: "NonExistentLabel".to_string(), // This label doesn't exist in catalog
+            properties: Default::default(),
+        };
+
+        let result = planner.plan(&scan);
+
+        // Should return ConfigError with helpful message
+        assert!(
+            result.is_err(),
+            "Should fail when catalog exists but label is missing"
+        );
+        match result {
+            Err(crate::error::GraphError::ConfigError { message, .. }) => {
+                assert!(
+                    message.contains("NonExistentLabel"),
+                    "Error should mention the missing label"
+                );
+                assert!(
+                    message.contains("not found"),
+                    "Error should indicate label not found"
+                );
+            }
+            _ => panic!("Expected ConfigError for missing node label"),
+        }
+    }
+
+    #[test]
+    fn test_scan_without_catalog_uses_empty_source() {
+        // Test that when no catalog is attached, scanning creates an empty source fallback
+        // This allows DataFusionPlanner::new() to work without requiring a catalog
+        let cfg = crate::config::GraphConfig::builder()
+            .with_node_label("Person", "id")
+            .build()
+            .unwrap();
+        let planner = DataFusionPlanner::new(cfg); // No catalog attached
+
+        let scan = LogicalOperator::ScanByLabel {
+            variable: "x".to_string(),
+            label: "AnyLabel".to_string(), // Any label works without catalog
+            properties: Default::default(),
+        };
+
+        let result = planner.plan(&scan);
+
+        // Should succeed with empty source fallback
+        assert!(
+            result.is_ok(),
+            "Should succeed with empty source when no catalog attached"
+        );
+    }
+
+    #[test]
+    fn test_expand_with_missing_relationship() {
+        // Test that expanding with non-existent relationship type handles gracefully
+        let cfg = crate::config::GraphConfig::builder()
+            .with_node_label("Person", "id")
+            .with_relationship("KNOWS", "src_id", "dst_id")
+            .build()
+            .unwrap();
+        let planner = DataFusionPlanner::with_catalog(cfg, make_catalog());
+
+        let scan = LogicalOperator::ScanByLabel {
+            variable: "a".to_string(),
+            label: "Person".to_string(),
+            properties: Default::default(),
+        };
+
+        let expand = LogicalOperator::Expand {
+            input: Box::new(scan),
+            source_variable: "a".to_string(),
+            target_variable: "b".to_string(),
+            target_label: "Person".to_string(),
+            relationship_types: vec!["NONEXISTENT_REL".to_string()], // Doesn't exist
+            direction: crate::ast::RelationshipDirection::Outgoing,
+            relationship_variable: None,
+            properties: Default::default(),
+            target_properties: Default::default(),
+        };
+
+        let result = planner.plan(&expand);
+
+        // Should handle gracefully - either error or empty result
+        // The key is no panic
+        match result {
+            Ok(_) => {} // Graceful handling
+            Err(e) => {
+                // Should be a PlanError
+                assert!(matches!(e, crate::error::GraphError::PlanError { .. }));
+            }
+        }
+    }
+
+    #[test]
+    fn test_filter_preserves_error_context() {
+        // Test that filter errors include helpful context
+        use crate::ast::{BooleanExpression, PropertyRef, ValueExpression};
+
+        let cfg = crate::config::GraphConfig::builder()
+            .with_node_label("Person", "id")
+            .build()
+            .unwrap();
+        let planner = DataFusionPlanner::with_catalog(cfg, make_catalog());
+
+        let scan = LogicalOperator::ScanByLabel {
+            variable: "p".to_string(),
+            label: "Person".to_string(),
+            properties: Default::default(),
+        };
+
+        // Create a filter with a property reference
+        let filter = LogicalOperator::Filter {
+            input: Box::new(scan),
+            predicate: BooleanExpression::Comparison {
+                left: ValueExpression::Property(PropertyRef {
+                    variable: "p".to_string(),
+                    property: "age".to_string(),
+                }),
+                operator: crate::ast::ComparisonOperator::GreaterThan,
+                right: ValueExpression::Literal(crate::ast::PropertyValue::Integer(30)),
+            },
+        };
+
+        let result = planner.plan(&filter);
+
+        // Should succeed - this tests that valid filters work
+        assert!(result.is_ok(), "Valid filter should succeed");
+    }
+
+    #[test]
+    fn test_variable_length_with_invalid_range() {
+        // Test that invalid variable-length ranges are caught
+        let cfg = crate::config::GraphConfig::builder()
+            .with_node_label("Person", "id")
+            .with_relationship("KNOWS", "src_id", "dst_id")
+            .build()
+            .unwrap();
+        let planner = DataFusionPlanner::with_catalog(cfg, make_catalog());
+
+        let scan = LogicalOperator::ScanByLabel {
+            variable: "a".to_string(),
+            label: "Person".to_string(),
+            properties: Default::default(),
+        };
+
+        let var_expand = LogicalOperator::VariableLengthExpand {
+            input: Box::new(scan),
+            source_variable: "a".to_string(),
+            target_variable: "b".to_string(),
+            relationship_types: vec!["KNOWS".to_string()],
+            direction: crate::ast::RelationshipDirection::Outgoing,
+            min_length: Some(5), // min > max
+            max_length: Some(2),
+            relationship_variable: None,
+            target_properties: Default::default(),
+        };
+
+        let result = planner.plan(&var_expand);
+
+        // Should return InvalidPattern error
+        assert!(result.is_err(), "Invalid range should return error");
+        match result {
+            Err(crate::error::GraphError::InvalidPattern { message, .. }) => {
+                assert!(message.contains("min"), "Error should mention min");
+                assert!(message.contains("max"), "Error should mention max");
+            }
+            _ => panic!("Expected InvalidPattern error"),
+        }
+    }
+
+    #[test]
+    fn test_variable_length_exceeds_max_hops() {
+        // Test that exceeding MAX_VARIABLE_LENGTH_HOPS is caught
+        let cfg = crate::config::GraphConfig::builder()
+            .with_node_label("Person", "id")
+            .with_relationship("KNOWS", "src_id", "dst_id")
+            .build()
+            .unwrap();
+        let planner = DataFusionPlanner::with_catalog(cfg, make_catalog());
+
+        let scan = LogicalOperator::ScanByLabel {
+            variable: "a".to_string(),
+            label: "Person".to_string(),
+            properties: Default::default(),
+        };
+
+        let var_expand = LogicalOperator::VariableLengthExpand {
+            input: Box::new(scan),
+            source_variable: "a".to_string(),
+            target_variable: "b".to_string(),
+            relationship_types: vec!["KNOWS".to_string()],
+            direction: crate::ast::RelationshipDirection::Outgoing,
+            min_length: Some(1),
+            max_length: Some(100), // Way too high
+            relationship_variable: None,
+            target_properties: Default::default(),
+        };
+
+        let result = planner.plan(&var_expand);
+
+        // Should return UnsupportedFeature error
+        assert!(result.is_err(), "Exceeding max hops should return error");
+        match result {
+            Err(crate::error::GraphError::UnsupportedFeature { feature, .. }) => {
+                assert!(
+                    feature.contains("Variable-length"),
+                    "Error should mention variable-length"
+                );
+            }
+            _ => panic!("Expected UnsupportedFeature error"),
+        }
     }
 }

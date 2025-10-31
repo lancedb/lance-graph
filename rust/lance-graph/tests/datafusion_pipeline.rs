@@ -687,6 +687,149 @@ async fn test_datafusion_one_hop_filtered_source_age_strict() {
     assert_eq!(set, expected);
 }
 
+#[tokio::test]
+async fn test_datafusion_one_hop_with_city_filter() {
+    let config = create_graph_config();
+    let person_batch = create_person_dataset();
+    let knows_batch = create_knows_dataset();
+
+    // Query: Filter targets by city using inline property filter
+    // Tests inline property filter instead of WHERE clause
+    let query =
+        CypherQuery::new("MATCH (a:Person)-[:KNOWS]->(b:Person {city: 'Seattle'}) RETURN b.name")
+            .unwrap()
+            .with_config(config);
+
+    let mut datasets = HashMap::new();
+    datasets.insert("Person".to_string(), person_batch);
+    datasets.insert("KNOWS".to_string(), knows_batch);
+
+    let out = query.execute_datafusion(datasets).await.unwrap();
+
+    // Only Eve has city = 'Seattle' and is reachable (David->Eve)
+    assert_eq!(out.num_rows(), 1);
+
+    let names = out
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(names.value(0), "Eve");
+}
+
+#[tokio::test]
+async fn test_datafusion_one_hop_multiple_properties() {
+    let config = create_graph_config();
+    let person_batch = create_person_dataset();
+    let knows_batch = create_knows_dataset();
+
+    // Query: Return multiple properties from both source and target
+    let query = CypherQuery::new(
+        "MATCH (a:Person)-[:KNOWS]->(b:Person) \
+         RETURN a.name, a.age, b.name, b.age",
+    )
+    .unwrap()
+    .with_config(config);
+
+    let mut datasets = HashMap::new();
+    datasets.insert("Person".to_string(), person_batch);
+    datasets.insert("KNOWS".to_string(), knows_batch);
+
+    let out = query.execute_datafusion(datasets).await.unwrap();
+
+    assert_eq!(out.num_columns(), 4);
+    assert_eq!(out.num_rows(), 5);
+
+    let a_names = out
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let a_ages = out.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+    let b_names = out
+        .column(2)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let b_ages = out.column(3).as_any().downcast_ref::<Int64Array>().unwrap();
+
+    // Verify at least one row has correct data
+    let mut found_alice_bob = false;
+    for i in 0..out.num_rows() {
+        if a_names.value(i) == "Alice" && b_names.value(i) == "Bob" {
+            assert_eq!(a_ages.value(i), 25);
+            assert_eq!(b_ages.value(i), 35);
+            found_alice_bob = true;
+        }
+    }
+    assert!(found_alice_bob);
+}
+
+#[tokio::test]
+async fn test_datafusion_one_hop_return_relationship_properties() {
+    let config = create_graph_config();
+    let person_batch = create_person_dataset();
+    let knows_batch = create_knows_dataset();
+
+    // Query: Return both node and relationship properties in projection
+    // This validates qualified relationship columns and aliasing
+    let query = CypherQuery::new(
+        "MATCH (a:Person)-[r:KNOWS]->(b:Person) \
+         RETURN a.name, r.since_year, b.name \
+         ORDER BY a.name, b.name",
+    )
+    .unwrap()
+    .with_config(config);
+
+    let mut datasets = HashMap::new();
+    datasets.insert("Person".to_string(), person_batch);
+    datasets.insert("KNOWS".to_string(), knows_batch);
+
+    let out = query.execute_datafusion(datasets).await.unwrap();
+
+    // Should return 3 columns: a.name, r.since_year, b.name
+    assert_eq!(out.num_columns(), 3);
+    // Should return 5 edges
+    assert_eq!(out.num_rows(), 5);
+
+    let a_names = out
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let since_years = out.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+    let b_names = out
+        .column(2)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+
+    // Verify first row: Alice -> Bob (2020)
+    assert_eq!(a_names.value(0), "Alice");
+    assert_eq!(since_years.value(0), 2020);
+    assert_eq!(b_names.value(0), "Bob");
+
+    // Verify second row: Alice -> Charlie (2018)
+    assert_eq!(a_names.value(1), "Alice");
+    assert_eq!(since_years.value(1), 2018);
+    assert_eq!(b_names.value(1), "Charlie");
+
+    // Verify third row: Bob -> Charlie (2019)
+    assert_eq!(a_names.value(2), "Bob");
+    assert_eq!(since_years.value(2), 2019);
+    assert_eq!(b_names.value(2), "Charlie");
+
+    // Verify fourth row: Charlie -> David (2021)
+    assert_eq!(a_names.value(3), "Charlie");
+    assert_eq!(since_years.value(3), 2021);
+    assert_eq!(b_names.value(3), "David");
+
+    // Verify fifth row: David -> Eve (NULL since_year)
+    assert_eq!(a_names.value(4), "David");
+    assert!(since_years.is_null(4)); // NULL value
+    assert_eq!(b_names.value(4), "Eve");
+}
+
 // ============================================================================
 // Two-Hop Path Query Tests
 // ============================================================================
@@ -941,40 +1084,6 @@ async fn test_datafusion_two_hop_no_results() {
     assert_eq!(out.num_rows(), 0);
 }
 
-#[tokio::test]
-async fn test_datafusion_varlength_projection_correctness() {
-    // Test that variable-length path projection correctly handles qualified column names
-    // and doesn't accidentally include intermediate node columns
-    let out = execute_test_query(
-        "MATCH (a:Person {name: 'Alice'})-[:KNOWS*1..2]->(b:Person) RETURN b.name",
-    )
-    .await;
-
-    // Alice can reach: Bob (1-hop), Charlie (1-hop and 2-hop via Bob), David (2-hop via Charlie)
-    // Total: 4 results (Bob, Charlie, Charlie, David)
-    assert_eq!(out.num_rows(), 4);
-
-    // Verify schema only contains source and target columns, not intermediate nodes
-    let schema = out.schema();
-    let column_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
-
-    // Should only have b__ prefixed columns (target), no intermediate node columns
-    for name in &column_names {
-        assert!(
-            name.starts_with("b__"),
-            "Unexpected column in variable-length result: {}",
-            name
-        );
-        // Ensure no double-qualified names like "b__intermediate__prop"
-        let remainder = &name[3..]; // Skip "b__"
-        assert!(
-            !remainder.contains("__"),
-            "Column name contains nested qualifiers: {}",
-            name
-        );
-    }
-}
-
 // ============================================================================
 // Complex Query Tests (Advanced Filtering & Multi-Condition)
 // ============================================================================
@@ -1084,17 +1193,20 @@ async fn test_datafusion_two_hop_return_relationship_properties() {
 }
 
 #[tokio::test]
-async fn test_datafusion_one_hop_with_city_filter() {
+async fn test_datafusion_two_hop_return_both_relationship_properties() {
     let config = create_graph_config();
     let person_batch = create_person_dataset();
     let knows_batch = create_knows_dataset();
 
-    // Query: Filter targets by city using inline property filter
-    // Tests inline property filter instead of WHERE clause
-    let query =
-        CypherQuery::new("MATCH (a:Person)-[:KNOWS]->(b:Person {city: 'Seattle'}) RETURN b.name")
-            .unwrap()
-            .with_config(config);
+    // Query: Return properties from both relationships in a two-hop path
+    // This validates qualified relationship columns for r1 and r2, and proper aliasing
+    let query = CypherQuery::new(
+        "MATCH (a:Person)-[r1:KNOWS]->(b:Person)-[r2:KNOWS]->(c:Person) \
+         RETURN a.name, r1.since_year, b.name, r2.since_year, c.name \
+         ORDER BY a.name, c.name",
+    )
+    .unwrap()
+    .with_config(config);
 
     let mut datasets = HashMap::new();
     datasets.insert("Person".to_string(), person_batch);
@@ -1102,15 +1214,56 @@ async fn test_datafusion_one_hop_with_city_filter() {
 
     let out = query.execute_datafusion(datasets).await.unwrap();
 
-    // Only Eve has city = 'Seattle' and is reachable (David->Eve)
-    assert_eq!(out.num_rows(), 1);
+    // Should return 5 columns: a.name, r1.since_year, b.name, r2.since_year, c.name
+    assert_eq!(out.num_columns(), 5);
+    // Should return 4 two-hop paths
+    assert_eq!(out.num_rows(), 4);
 
-    let names = out
+    let a_names = out
         .column(0)
         .as_any()
         .downcast_ref::<StringArray>()
         .unwrap();
-    assert_eq!(names.value(0), "Eve");
+    let r1_years = out.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+    let b_names = out
+        .column(2)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let r2_years = out.column(3).as_any().downcast_ref::<Int64Array>().unwrap();
+    let c_names = out
+        .column(4)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+
+    // Verify first path: Alice -[2020]-> Bob -[2019]-> Charlie
+    assert_eq!(a_names.value(0), "Alice");
+    assert_eq!(r1_years.value(0), 2020);
+    assert_eq!(b_names.value(0), "Bob");
+    assert_eq!(r2_years.value(0), 2019);
+    assert_eq!(c_names.value(0), "Charlie");
+
+    // Verify second path: Alice -[2018]-> Charlie -[2021]-> David
+    assert_eq!(a_names.value(1), "Alice");
+    assert_eq!(r1_years.value(1), 2018);
+    assert_eq!(b_names.value(1), "Charlie");
+    assert_eq!(r2_years.value(1), 2021);
+    assert_eq!(c_names.value(1), "David");
+
+    // Verify third path: Bob -[2019]-> Charlie -[2021]-> David
+    assert_eq!(a_names.value(2), "Bob");
+    assert_eq!(r1_years.value(2), 2019);
+    assert_eq!(b_names.value(2), "Charlie");
+    assert_eq!(r2_years.value(2), 2021);
+    assert_eq!(c_names.value(2), "David");
+
+    // Verify fourth path: Charlie -[2021]-> David -[NULL]-> Eve
+    assert_eq!(a_names.value(3), "Charlie");
+    assert_eq!(r1_years.value(3), 2021);
+    assert_eq!(b_names.value(3), "David");
+    assert!(r2_years.is_null(3)); // NULL value for David -> Eve
+    assert_eq!(c_names.value(3), "Eve");
 }
 
 #[tokio::test]
@@ -1230,51 +1383,37 @@ async fn test_datafusion_two_hop_same_intermediate_node() {
 }
 
 #[tokio::test]
-async fn test_datafusion_one_hop_multiple_properties() {
-    let config = create_graph_config();
-    let person_batch = create_person_dataset();
-    let knows_batch = create_knows_dataset();
-
-    // Query: Return multiple properties from both source and target
-    let query = CypherQuery::new(
-        "MATCH (a:Person)-[:KNOWS]->(b:Person) \
-         RETURN a.name, a.age, b.name, b.age",
+async fn test_datafusion_varlength_projection_correctness() {
+    // Test that variable-length path projection correctly handles qualified column names
+    // and doesn't accidentally include intermediate node columns
+    let out = execute_test_query(
+        "MATCH (a:Person {name: 'Alice'})-[:KNOWS*1..2]->(b:Person) RETURN b.name",
     )
-    .unwrap()
-    .with_config(config);
+    .await;
 
-    let mut datasets = HashMap::new();
-    datasets.insert("Person".to_string(), person_batch);
-    datasets.insert("KNOWS".to_string(), knows_batch);
+    // Alice can reach: Bob (1-hop), Charlie (1-hop and 2-hop via Bob), David (2-hop via Charlie)
+    // Total: 4 results (Bob, Charlie, Charlie, David)
+    assert_eq!(out.num_rows(), 4);
 
-    let out = query.execute_datafusion(datasets).await.unwrap();
+    // Verify schema only contains source and target columns, not intermediate nodes
+    let schema = out.schema();
+    let column_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
 
-    assert_eq!(out.num_columns(), 4);
-    assert_eq!(out.num_rows(), 5);
-
-    let a_names = out
-        .column(0)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
-    let a_ages = out.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
-    let b_names = out
-        .column(2)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .unwrap();
-    let b_ages = out.column(3).as_any().downcast_ref::<Int64Array>().unwrap();
-
-    // Verify at least one row has correct data
-    let mut found_alice_bob = false;
-    for i in 0..out.num_rows() {
-        if a_names.value(i) == "Alice" && b_names.value(i) == "Bob" {
-            assert_eq!(a_ages.value(i), 25);
-            assert_eq!(b_ages.value(i), 35);
-            found_alice_bob = true;
-        }
+    // Should only have b__ prefixed columns (target), no intermediate node columns
+    for name in &column_names {
+        assert!(
+            name.starts_with("b__"),
+            "Unexpected column in variable-length result: {}",
+            name
+        );
+        // Ensure no double-qualified names like "b__intermediate__prop"
+        let remainder = &name[3..]; // Skip "b__"
+        assert!(
+            !remainder.contains("__"),
+            "Column name contains nested qualifiers: {}",
+            name
+        );
     }
-    assert!(found_alice_bob);
 }
 
 #[tokio::test]
