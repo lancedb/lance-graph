@@ -84,6 +84,14 @@ impl CypherQuery {
         &self.parameters
     }
 
+    /// Get the required config, returning an error if not set
+    fn require_config(&self) -> Result<&GraphConfig> {
+        self.config.as_ref().ok_or_else(|| GraphError::ConfigError {
+            message: "Graph configuration is required for query execution".to_string(),
+            location: snafu::Location::new(file!(), line!(), column!()),
+        })
+    }
+
     /// Execute using the DataFusion planner with in-memory datasets
     ///
     /// # Overview
@@ -120,46 +128,12 @@ impl CypherQuery {
         &self,
         datasets: HashMap<String, arrow::record_batch::RecordBatch>,
     ) -> Result<arrow::record_batch::RecordBatch> {
-        use crate::source_catalog::InMemoryCatalog;
-        use datafusion::datasource::{DefaultTableSource, MemTable};
-        use datafusion::execution::context::SessionContext;
         use std::sync::Arc;
 
-        if datasets.is_empty() {
-            return Err(GraphError::ConfigError {
-                message: "No input datasets provided".to_string(),
-                location: snafu::Location::new(file!(), line!(), column!()),
-            });
-        }
-
-        // Create session context and catalog, register tables in both
-        let ctx = SessionContext::new();
-        let mut catalog: InMemoryCatalog = InMemoryCatalog::new();
-
-        for (name, batch) in &datasets {
-            let mem_table = Arc::new(
-                MemTable::try_new(batch.schema(), vec![vec![batch.clone()]]).map_err(|e| {
-                    GraphError::PlanError {
-                        message: format!("Failed to create MemTable for {}: {}", name, e),
-                        location: snafu::Location::new(file!(), line!(), column!()),
-                    }
-                })?,
-            );
-
-            let table_source = Arc::new(DefaultTableSource::new(mem_table.clone()));
-
-            // Register as both node and relationship source (planner will use whichever is appropriate)
-            catalog = catalog
-                .with_node_source(name, table_source.clone())
-                .with_relationship_source(name, table_source.clone());
-
-            // Register in session context for execution (using the same MemTable instance)
-            ctx.register_table(name, mem_table)
-                .map_err(|e| GraphError::PlanError {
-                    message: format!("Failed to register table {}: {}", name, e),
-                    location: snafu::Location::new(file!(), line!(), column!()),
-                })?;
-        }
+        // Build catalog and context from datasets
+        let (catalog, ctx) = self
+            .build_catalog_and_context_from_datasets(datasets)
+            .await?;
 
         // Delegate to common execution logic
         self.execute_with_catalog_and_context(Arc::new(catalog), ctx)
@@ -222,14 +196,7 @@ impl CypherQuery {
         use datafusion::datasource::DefaultTableSource;
         use std::sync::Arc;
 
-        // Require a config
-        let config = self
-            .config
-            .as_ref()
-            .ok_or_else(|| GraphError::ConfigError {
-                message: "Graph configuration is required for query execution".to_string(),
-                location: snafu::Location::new(file!(), line!(), column!()),
-            })?;
+        let config = self.require_config()?;
 
         // Build catalog by querying SessionContext for table providers
         let mut catalog = InMemoryCatalog::new();
@@ -314,35 +281,12 @@ impl CypherQuery {
         catalog: std::sync::Arc<dyn crate::source_catalog::GraphSourceCatalog>,
         ctx: datafusion::execution::context::SessionContext,
     ) -> Result<arrow::record_batch::RecordBatch> {
-        use crate::datafusion_planner::{DataFusionPlanner, GraphPhysicalPlanner};
-        use crate::semantic::SemanticAnalyzer;
         use arrow::compute::concat_batches;
 
-        // Require a config for DataFusion execution
-        let config = self
-            .config
-            .as_ref()
-            .ok_or_else(|| GraphError::ConfigError {
-                message: "Graph configuration is required for DataFusion execution".to_string(),
-                location: snafu::Location::new(file!(), line!(), column!()),
-            })?;
+        // Create logical plans (phases 1-3)
+        let (_logical_plan, df_logical_plan) = self.create_logical_plans(catalog)?;
 
-        // Phase 1: Semantic Analysis
-        let mut analyzer = SemanticAnalyzer::new(config.clone());
-        analyzer.analyze(&self.ast)?;
-
-        // Phase 2: Logical Planning
-        let mut logical_planner = LogicalPlanner::new();
-        let logical_plan = logical_planner.plan(&self.ast)?;
-
-        // Phase 3: DataFusion Logical Planning
-        // Convert graph logical plan to DataFusion logical plan
-        let df_planner = DataFusionPlanner::with_catalog(config.clone(), catalog);
-        let df_logical_plan = df_planner.plan(&logical_plan)?;
-
-        // Phase 4: Physical Planning and Execution
-        // DataFusion optimizes the logical plan, creates a physical execution plan,
-        // and executes it against the pre-configured SessionContext
+        // Execute the DataFusion plan (phase 4)
         let df = ctx
             .execute_logical_plan(df_logical_plan)
             .await
@@ -374,6 +318,289 @@ impl CypherQuery {
         })
     }
 
+    /// Explain the query execution plan using in-memory datasets
+    ///
+    /// Returns a formatted string showing the query execution plan at different stages:
+    /// - Graph Logical Plan (graph-specific operators)
+    /// - DataFusion Logical Plan (optimized relational plan)
+    /// - DataFusion Physical Plan (execution plan with optimizations)
+    ///
+    /// This is useful for understanding query performance, debugging, and optimization.
+    ///
+    /// # Arguments
+    /// * `datasets` - HashMap of table name to RecordBatch (nodes and relationships)
+    ///
+    /// # Returns
+    /// A formatted string containing the execution plan at multiple levels
+    ///
+    /// # Errors
+    /// Returns error if planning fails
+    ///
+    /// # Example
+    /// ```ignore
+    /// use std::collections::HashMap;
+    /// use arrow::record_batch::RecordBatch;
+    /// use lance_graph::query::CypherQuery;
+    ///
+    /// // Create in-memory datasets
+    /// let mut datasets = HashMap::new();
+    /// datasets.insert("Person".to_string(), person_batch);
+    /// datasets.insert("KNOWS".to_string(), knows_batch);
+    ///
+    /// let query = CypherQuery::parse("MATCH (p:Person) WHERE p.age > 30 RETURN p.name")?
+    ///     .with_config(config);
+    ///
+    /// let plan = query.explain_datafusion(datasets).await?;
+    /// println!("{}", plan);
+    /// ```
+    pub async fn explain_datafusion(
+        &self,
+        datasets: HashMap<String, arrow::record_batch::RecordBatch>,
+    ) -> Result<String> {
+        use std::sync::Arc;
+
+        // Build catalog and context from datasets
+        let (catalog, ctx) = self
+            .build_catalog_and_context_from_datasets(datasets)
+            .await?;
+
+        // Delegate to the internal explain method
+        self.explain_internal(Arc::new(catalog), ctx).await
+    }
+
+    /// Helper to build catalog and context from in-memory datasets
+    async fn build_catalog_and_context_from_datasets(
+        &self,
+        datasets: HashMap<String, arrow::record_batch::RecordBatch>,
+    ) -> Result<(
+        crate::source_catalog::InMemoryCatalog,
+        datafusion::execution::context::SessionContext,
+    )> {
+        use crate::source_catalog::InMemoryCatalog;
+        use datafusion::datasource::{DefaultTableSource, MemTable};
+        use datafusion::execution::context::SessionContext;
+        use std::sync::Arc;
+
+        if datasets.is_empty() {
+            return Err(GraphError::ConfigError {
+                message: "No input datasets provided".to_string(),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            });
+        }
+
+        // Create session context and catalog
+        let ctx = SessionContext::new();
+        let mut catalog = InMemoryCatalog::new();
+
+        // Register all datasets as tables
+        for (name, batch) in &datasets {
+            let mem_table = Arc::new(
+                MemTable::try_new(batch.schema(), vec![vec![batch.clone()]]).map_err(|e| {
+                    GraphError::PlanError {
+                        message: format!("Failed to create MemTable for {}: {}", name, e),
+                        location: snafu::Location::new(file!(), line!(), column!()),
+                    }
+                })?,
+            );
+
+            // Register in session context for execution
+            ctx.register_table(name, mem_table.clone())
+                .map_err(|e| GraphError::PlanError {
+                    message: format!("Failed to register table {}: {}", name, e),
+                    location: snafu::Location::new(file!(), line!(), column!()),
+                })?;
+
+            let table_source = Arc::new(DefaultTableSource::new(mem_table));
+
+            // Register as both node and relationship source
+            // The planner will use whichever is appropriate based on the query
+            catalog = catalog
+                .with_node_source(name, table_source.clone())
+                .with_relationship_source(name, table_source);
+        }
+
+        Ok((catalog, ctx))
+    }
+
+    /// Internal helper to explain the query execution plan with explicit catalog and session context
+    async fn explain_internal(
+        &self,
+        catalog: std::sync::Arc<dyn crate::source_catalog::GraphSourceCatalog>,
+        ctx: datafusion::execution::context::SessionContext,
+    ) -> Result<String> {
+        // Create all plans (phases 1-4)
+        let (logical_plan, df_logical_plan, physical_plan) =
+            self.create_plans(catalog, &ctx).await?;
+
+        // Format the explain output
+        self.format_explain_output(&logical_plan, &df_logical_plan, physical_plan.as_ref())
+    }
+
+    /// Helper to create logical plans (graph logical, DataFusion logical)
+    ///
+    /// This performs phases 1-3 of query execution (semantic analysis, graph logical planning,
+    /// DataFusion logical planning) without creating the physical plan.
+    fn create_logical_plans(
+        &self,
+        catalog: std::sync::Arc<dyn crate::source_catalog::GraphSourceCatalog>,
+    ) -> Result<(
+        crate::logical_plan::LogicalOperator,
+        datafusion::logical_expr::LogicalPlan,
+    )> {
+        use crate::datafusion_planner::{DataFusionPlanner, GraphPhysicalPlanner};
+        use crate::semantic::SemanticAnalyzer;
+
+        let config = self.require_config()?;
+
+        // Phase 1: Semantic Analysis
+        let mut analyzer = SemanticAnalyzer::new(config.clone());
+        analyzer.analyze(&self.ast)?;
+
+        // Phase 2: Graph Logical Plan
+        let mut logical_planner = LogicalPlanner::new();
+        let logical_plan = logical_planner.plan(&self.ast)?;
+
+        // Phase 3: DataFusion Logical Plan
+        let df_planner = DataFusionPlanner::with_catalog(config.clone(), catalog);
+        let df_logical_plan = df_planner.plan(&logical_plan)?;
+
+        Ok((logical_plan, df_logical_plan))
+    }
+
+    /// Helper to create all plans (graph logical, DataFusion logical, physical)
+    async fn create_plans(
+        &self,
+        catalog: std::sync::Arc<dyn crate::source_catalog::GraphSourceCatalog>,
+        ctx: &datafusion::execution::context::SessionContext,
+    ) -> Result<(
+        crate::logical_plan::LogicalOperator,
+        datafusion::logical_expr::LogicalPlan,
+        std::sync::Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+    )> {
+        // Phases 1-3: Create logical plans
+        let (logical_plan, df_logical_plan) = self.create_logical_plans(catalog)?;
+
+        // Phase 4: DataFusion Physical Plan
+        let df = ctx
+            .execute_logical_plan(df_logical_plan.clone())
+            .await
+            .map_err(|e| GraphError::ExecutionError {
+                message: format!("Failed to execute DataFusion plan: {}", e),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            })?;
+
+        let physical_plan =
+            df.create_physical_plan()
+                .await
+                .map_err(|e| GraphError::ExecutionError {
+                    message: format!("Failed to create physical plan: {}", e),
+                    location: snafu::Location::new(file!(), line!(), column!()),
+                })?;
+
+        Ok((logical_plan, df_logical_plan, physical_plan))
+    }
+
+    /// Format explain output as a table
+    fn format_explain_output(
+        &self,
+        logical_plan: &crate::logical_plan::LogicalOperator,
+        df_logical_plan: &datafusion::logical_expr::LogicalPlan,
+        physical_plan: &dyn datafusion::physical_plan::ExecutionPlan,
+    ) -> Result<String> {
+        // Format output with query first, then table
+        let mut output = String::new();
+
+        // Show Cypher query before the table
+        output.push_str("Cypher Query:\n");
+        output.push_str(&format!("  {}\n\n", self.query_text));
+
+        // Build table rows (without the query)
+        let mut rows = vec![];
+
+        // Row 1: Graph Logical Plan
+        let graph_plan_str = format!("{:#?}", logical_plan);
+        rows.push(("graph_logical_plan", graph_plan_str));
+
+        // Row 2: DataFusion Logical Plan
+        let df_logical_str = format!("{}", df_logical_plan.display_indent());
+        rows.push(("logical_plan", df_logical_str));
+
+        // Row 3: DataFusion Physical Plan
+        let df_physical_str = format!(
+            "{}",
+            datafusion::physical_plan::displayable(physical_plan).indent(true)
+        );
+        rows.push(("physical_plan", df_physical_str));
+
+        // Calculate column widths
+        let plan_type_width = rows.iter().map(|(t, _)| t.len()).max().unwrap_or(10);
+        let plan_width = rows
+            .iter()
+            .map(|(_, p)| p.lines().map(|l| l.len()).max().unwrap_or(0))
+            .max()
+            .unwrap_or(50);
+
+        // Build table
+        let separator = format!(
+            "+{}+{}+",
+            "-".repeat(plan_type_width + 2),
+            "-".repeat(plan_width + 2)
+        );
+
+        output.push_str(&separator);
+        output.push('\n');
+
+        // Header
+        output.push_str(&format!(
+            "| {:<width$} | {:<plan_width$} |\n",
+            "plan_type",
+            "plan",
+            width = plan_type_width,
+            plan_width = plan_width
+        ));
+        output.push_str(&separator);
+        output.push('\n');
+
+        // Data rows
+        for (plan_type, plan_content) in rows {
+            let lines: Vec<&str> = plan_content.lines().collect();
+            if lines.is_empty() {
+                output.push_str(&format!(
+                    "| {:<width$} | {:<plan_width$} |\n",
+                    plan_type,
+                    "",
+                    width = plan_type_width,
+                    plan_width = plan_width
+                ));
+            } else {
+                // First line with plan_type
+                output.push_str(&format!(
+                    "| {:<width$} | {:<plan_width$} |\n",
+                    plan_type,
+                    lines[0],
+                    width = plan_type_width,
+                    plan_width = plan_width
+                ));
+
+                // Remaining lines with empty plan_type
+                for line in &lines[1..] {
+                    output.push_str(&format!(
+                        "| {:<width$} | {:<plan_width$} |\n",
+                        "",
+                        line,
+                        width = plan_type_width,
+                        plan_width = plan_width
+                    ));
+                }
+            }
+        }
+
+        output.push_str(&separator);
+        output.push('\n');
+
+        Ok(output)
+    }
+
     /// Execute this Cypher query against Lance datasets
     ///
     /// Note: This initial implementation supports a single-table projection/filter/limit
@@ -389,13 +616,7 @@ impl CypherQuery {
         use std::sync::Arc;
 
         // Require a config for now, even if we don't fully exploit it yet
-        let _config = self
-            .config
-            .as_ref()
-            .ok_or_else(|| GraphError::ConfigError {
-                message: "Graph configuration is required for query execution".to_string(),
-                location: snafu::Location::new(file!(), line!(), column!()),
-            })?;
+        let _config = self.require_config()?;
 
         if datasets.is_empty() {
             return Err(GraphError::PlanError {
@@ -718,10 +939,7 @@ impl CypherQuery {
             [GraphPattern::Path(p)] if !p.segments.is_empty() => p,
             _ => return Ok(None),
         };
-        let cfg = self.config.as_ref().ok_or_else(|| GraphError::PlanError {
-            message: "Graph configuration is required for execution".to_string(),
-            location: snafu::Location::new(file!(), line!(), column!()),
-        })?;
+        let cfg = self.require_config()?;
 
         // Handle single-segment variable-length paths by unrolling ranges (*1..N, capped)
         if path.segments.len() == 1 {
@@ -835,10 +1053,7 @@ impl CypherQuery {
         let end_alias = seg.end_node.variable.as_deref().unwrap_or(end_label);
 
         // Validate mappings
-        let cfg = self.config.as_ref().ok_or_else(|| GraphError::PlanError {
-            message: "Graph configuration is required for execution".to_string(),
-            location: snafu::Location::new(file!(), line!(), column!()),
-        })?;
+        let cfg = self.require_config()?;
         let start_map = cfg
             .get_node_mapping(start_label)
             .ok_or_else(|| GraphError::PlanError {
