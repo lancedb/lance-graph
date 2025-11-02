@@ -84,52 +84,57 @@ impl CypherQuery {
         &self.parameters
     }
 
-    /// Execute using the DataFusion planner with enhanced filtering support
-    /// Pipeline: Semantic Analysis -> Logical Plan -> Physical Plan (DataFusion)
+    /// Execute using the DataFusion planner with in-memory datasets
     ///
-    /// This implementation uses DataFusion's DefaultTableSource with proper catalog
-    /// integration to support filtering and basic query operations.
+    /// # Overview
+    /// This convenience method creates both a catalog and session context from the provided
+    /// in-memory RecordBatches. It's ideal for testing and small datasets that fit in memory.
     ///
-    /// WARNING: Experimental API. Semantics (e.g., row multiplicity) and performance characteristics
-    /// may change as the DataFusion planner matures. Some features like ORDER BY are not yet implemented
-    /// in this path. Prefer the `execute` for stability, or opt into this method knowingly.
+    /// For production use with external data sources (CSV, Parquet, databases), use
+    /// `execute_with_datafusion_context` instead, which automatically builds the catalog
+    /// from the SessionContext.
+    ///
+    /// # Arguments
+    /// * `datasets` - HashMap of table name to RecordBatch (nodes and relationships)
+    ///
+    /// # Returns
+    /// A single RecordBatch containing the query results
+    ///
+    /// # Example
+    /// ```ignore
+    /// use std::collections::HashMap;
+    /// use arrow::record_batch::RecordBatch;
+    /// use lance_graph::query::CypherQuery;
+    ///
+    /// // Create in-memory datasets
+    /// let mut datasets = HashMap::new();
+    /// datasets.insert("Person".to_string(), person_batch);
+    /// datasets.insert("KNOWS".to_string(), knows_batch);
+    ///
+    /// // Parse and execute query
+    /// let query = CypherQuery::parse("MATCH (p:Person)-[:KNOWS]->(f) RETURN p.name, f.name")?
+    ///     .with_config(config);
+    /// let result = query.execute_datafusion(datasets).await?;
+    /// ```
     pub async fn execute_datafusion(
         &self,
         datasets: HashMap<String, arrow::record_batch::RecordBatch>,
     ) -> Result<arrow::record_batch::RecordBatch> {
-        use crate::datafusion_planner::{DataFusionPlanner, GraphPhysicalPlanner};
-        use crate::semantic::SemanticAnalyzer;
-        use arrow::compute::concat_batches;
+        use crate::source_catalog::InMemoryCatalog;
+        use datafusion::datasource::{DefaultTableSource, MemTable};
         use datafusion::execution::context::SessionContext;
-
-        // Require a config for DataFusion execution
-        let config = self.config.as_ref().ok_or_else(|| GraphError::PlanError {
-            message: "Graph configuration is required for DataFusion execution".to_string(),
-            location: snafu::Location::new(file!(), line!(), column!()),
-        })?;
+        use std::sync::Arc;
 
         if datasets.is_empty() {
-            return Err(GraphError::PlanError {
+            return Err(GraphError::ConfigError {
                 message: "No input datasets provided".to_string(),
                 location: snafu::Location::new(file!(), line!(), column!()),
             });
         }
 
-        // Phase 1: Semantic Analysis
-        let mut analyzer = SemanticAnalyzer::new(config.clone());
-        analyzer.analyze(&self.ast)?;
-
-        // Phase 2: Logical Planning
-        let mut logical_planner = LogicalPlanner::new();
-        let logical_plan = logical_planner.plan(&self.ast)?;
-
         // Create session context and catalog, register tables in both
         let ctx = SessionContext::new();
-        use crate::source_catalog::InMemoryCatalog;
-        use datafusion::datasource::{DefaultTableSource, MemTable};
-        use std::sync::Arc;
-
-        let mut catalog = InMemoryCatalog::new();
+        let mut catalog: InMemoryCatalog = InMemoryCatalog::new();
 
         for (name, batch) in &datasets {
             let mem_table = Arc::new(
@@ -144,8 +149,9 @@ impl CypherQuery {
             let table_source = Arc::new(DefaultTableSource::new(mem_table.clone()));
 
             // Register as both node and relationship source (planner will use whichever is appropriate)
-            catalog = catalog.with_node_source(name, table_source.clone());
-            catalog = catalog.with_relationship_source(name, table_source);
+            catalog = catalog
+                .with_node_source(name, table_source.clone())
+                .with_relationship_source(name, table_source.clone());
 
             // Register in session context for execution (using the same MemTable instance)
             ctx.register_table(name, mem_table)
@@ -155,35 +161,214 @@ impl CypherQuery {
                 })?;
         }
 
-        // Use DataFusion planner with catalog that has the actual MemTables
-        let df_planner = DataFusionPlanner::with_catalog(config.clone(), Arc::new(catalog));
+        // Delegate to common execution logic
+        self.execute_with_catalog_and_context(Arc::new(catalog), ctx)
+            .await
+    }
+
+    /// Execute query with a DataFusion SessionContext, automatically building the catalog
+    ///
+    /// This is a convenience method that builds the graph catalog by querying the
+    /// SessionContext for table schemas. The GraphConfig determines which tables to
+    /// look up (node labels and relationship types).
+    ///
+    /// This method is ideal for integrating with DataFusion's rich data source ecosystem
+    /// (CSV, Parquet, Delta Lake, Iceberg, etc.) without manually building a catalog.
+    ///
+    /// # Arguments
+    /// * `ctx` - DataFusion SessionContext with pre-registered tables
+    ///
+    /// # Returns
+    /// Query results as an Arrow RecordBatch
+    ///
+    /// # Errors
+    /// Returns error if:
+    /// - GraphConfig is not set (use `.with_config()` first)
+    /// - Required tables are not registered in the SessionContext
+    /// - Query execution fails
+    ///
+    /// # Example
+    /// ```ignore
+    /// use datafusion::execution::context::SessionContext;
+    /// use datafusion::prelude::CsvReadOptions;
+    /// use lance_graph::{CypherQuery, GraphConfig};
+    ///
+    /// // Step 1: Create GraphConfig
+    /// let config = GraphConfig::builder()
+    ///     .with_node_label("Person", "person_id")
+    ///     .with_relationship("KNOWS", "src_id", "dst_id")
+    ///     .build()?;
+    ///
+    /// // Step 2: Register data sources in DataFusion
+    /// let ctx = SessionContext::new();
+    /// ctx.register_csv("Person", "data/persons.csv", CsvReadOptions::default()).await?;
+    /// ctx.register_parquet("KNOWS", "s3://bucket/knows.parquet", Default::default()).await?;
+    ///
+    /// // Step 3: Execute query (catalog is built automatically)
+    /// let query = CypherQuery::parse("MATCH (p:Person)-[:KNOWS]->(f) RETURN p.name")?
+    ///     .with_config(config);
+    /// let result = query.execute_with_datafusion_context(ctx).await?;
+    /// ```
+    ///
+    /// # Note
+    /// The catalog is built by querying the SessionContext for schemas of tables
+    /// mentioned in the GraphConfig. Table names must match between GraphConfig
+    /// (node labels/relationship types) and SessionContext (registered table names).
+    pub async fn execute_with_datafusion_context(
+        &self,
+        ctx: datafusion::execution::context::SessionContext,
+    ) -> Result<arrow::record_batch::RecordBatch> {
+        use crate::source_catalog::InMemoryCatalog;
+        use datafusion::datasource::DefaultTableSource;
+        use std::sync::Arc;
+
+        // Require a config
+        let config = self
+            .config
+            .as_ref()
+            .ok_or_else(|| GraphError::ConfigError {
+                message: "Graph configuration is required for query execution".to_string(),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            })?;
+
+        // Build catalog by querying SessionContext for table providers
+        let mut catalog = InMemoryCatalog::new();
+
+        // Register node sources
+        for label in config.node_mappings.keys() {
+            let table_provider =
+                ctx.table_provider(label)
+                    .await
+                    .map_err(|e| GraphError::ConfigError {
+                        message: format!(
+                            "Node label '{}' not found in SessionContext: {}",
+                            label, e
+                        ),
+                        location: snafu::Location::new(file!(), line!(), column!()),
+                    })?;
+
+            let table_source = Arc::new(DefaultTableSource::new(table_provider));
+            catalog = catalog.with_node_source(label, table_source);
+        }
+
+        // Register relationship sources
+        for rel_type in config.relationship_mappings.keys() {
+            let table_provider =
+                ctx.table_provider(rel_type)
+                    .await
+                    .map_err(|e| GraphError::ConfigError {
+                        message: format!(
+                            "Relationship type '{}' not found in SessionContext: {}",
+                            rel_type, e
+                        ),
+                        location: snafu::Location::new(file!(), line!(), column!()),
+                    })?;
+
+            let table_source = Arc::new(DefaultTableSource::new(table_provider));
+            catalog = catalog.with_relationship_source(rel_type, table_source);
+        }
+
+        // Execute using the built catalog
+        self.execute_with_catalog_and_context(Arc::new(catalog), ctx)
+            .await
+    }
+
+    /// Execute query with an explicit catalog and session context
+    ///
+    /// This is the most flexible API for advanced users who want to provide their own
+    /// catalog implementation or have fine-grained control over both the catalog and
+    /// session context.
+    ///
+    /// # Arguments
+    /// * `catalog` - Graph catalog containing node and relationship schemas for planning
+    /// * `ctx` - DataFusion SessionContext with registered data sources for execution
+    ///
+    /// # Returns
+    /// Query results as an Arrow RecordBatch
+    ///
+    /// # Errors
+    /// Returns error if query parsing, planning, or execution fails
+    ///
+    /// # Example
+    /// ```ignore
+    /// use std::sync::Arc;
+    /// use datafusion::execution::context::SessionContext;
+    /// use lance_graph::source_catalog::InMemoryCatalog;
+    /// use lance_graph::query::CypherQuery;
+    ///
+    /// // Create custom catalog
+    /// let catalog = InMemoryCatalog::new()
+    ///     .with_node_source("Person", custom_table_source);
+    ///
+    /// // Create SessionContext
+    /// let ctx = SessionContext::new();
+    /// ctx.register_table("Person", custom_table).unwrap();
+    ///
+    /// // Execute with explicit catalog and context
+    /// let query = CypherQuery::parse("MATCH (p:Person) RETURN p.name")?
+    ///     .with_config(config);
+    /// let result = query.execute_with_catalog_and_context(Arc::new(catalog), ctx).await?;
+    /// ```
+    pub async fn execute_with_catalog_and_context(
+        &self,
+        catalog: std::sync::Arc<dyn crate::source_catalog::GraphSourceCatalog>,
+        ctx: datafusion::execution::context::SessionContext,
+    ) -> Result<arrow::record_batch::RecordBatch> {
+        use crate::datafusion_planner::{DataFusionPlanner, GraphPhysicalPlanner};
+        use crate::semantic::SemanticAnalyzer;
+        use arrow::compute::concat_batches;
+
+        // Require a config for DataFusion execution
+        let config = self
+            .config
+            .as_ref()
+            .ok_or_else(|| GraphError::ConfigError {
+                message: "Graph configuration is required for DataFusion execution".to_string(),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            })?;
+
+        // Phase 1: Semantic Analysis
+        let mut analyzer = SemanticAnalyzer::new(config.clone());
+        analyzer.analyze(&self.ast)?;
+
+        // Phase 2: Logical Planning
+        let mut logical_planner = LogicalPlanner::new();
+        let logical_plan = logical_planner.plan(&self.ast)?;
+
+        // Phase 3: DataFusion Logical Planning
+        // Convert graph logical plan to DataFusion logical plan
+        let df_planner = DataFusionPlanner::with_catalog(config.clone(), catalog);
         let df_logical_plan = df_planner.plan(&logical_plan)?;
 
-        // Execute the logical plan against the registered tables
+        // Phase 4: Physical Planning and Execution
+        // DataFusion optimizes the logical plan, creates a physical execution plan,
+        // and executes it against the pre-configured SessionContext
         let df = ctx
             .execute_logical_plan(df_logical_plan)
             .await
-            .map_err(|e| GraphError::PlanError {
+            .map_err(|e| GraphError::ExecutionError {
                 message: format!("Failed to execute DataFusion plan: {}", e),
                 location: snafu::Location::new(file!(), line!(), column!()),
             })?;
 
+        // Get schema before collecting (in case result is empty)
+        let result_schema = df.schema().inner().clone();
+
         // Collect results
-        let batches = df.collect().await.map_err(|e| GraphError::PlanError {
-            message: format!("Failed to collect DataFusion results: {}", e),
+        let batches = df.collect().await.map_err(|e| GraphError::ExecutionError {
+            message: format!("Failed to collect query results: {}", e),
             location: snafu::Location::new(file!(), line!(), column!()),
         })?;
 
         if batches.is_empty() {
-            // Return empty batch with schema from first dataset
-            let first_batch = datasets.values().next().unwrap();
-            let empty_batch = arrow::record_batch::RecordBatch::new_empty(first_batch.schema());
-            return Ok(empty_batch);
+            // Return empty batch with the schema from the DataFrame
+            // This preserves column structure even when there are no rows
+            return Ok(arrow::record_batch::RecordBatch::new_empty(result_schema));
         }
 
         // Combine all batches
         let schema = batches[0].schema();
-        concat_batches(&schema, &batches).map_err(|e| GraphError::PlanError {
+        concat_batches(&schema, &batches).map_err(|e| GraphError::ExecutionError {
             message: format!("Failed to concatenate result batches: {}", e),
             location: snafu::Location::new(file!(), line!(), column!()),
         })
@@ -204,10 +389,13 @@ impl CypherQuery {
         use std::sync::Arc;
 
         // Require a config for now, even if we don't fully exploit it yet
-        let _config = self.config.as_ref().ok_or_else(|| GraphError::PlanError {
-            message: "Graph configuration is required for query execution".to_string(),
-            location: snafu::Location::new(file!(), line!(), column!()),
-        })?;
+        let _config = self
+            .config
+            .as_ref()
+            .ok_or_else(|| GraphError::ConfigError {
+                message: "Graph configuration is required for query execution".to_string(),
+                location: snafu::Location::new(file!(), line!(), column!()),
+            })?;
 
         if datasets.is_empty() {
             return Err(GraphError::PlanError {
@@ -1774,5 +1962,289 @@ mod tests {
         let expected: std::collections::HashSet<String> =
             ["Alice", "Bob"].iter().map(|s| s.to_string()).collect();
         assert_eq!(name_set, expected, "Should return Alice and Bob");
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_context_simple_scan() {
+        use arrow_array::{Int64Array, RecordBatch, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        use datafusion::datasource::MemTable;
+        use datafusion::execution::context::SessionContext;
+        use std::sync::Arc;
+
+        // Create test data
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("age", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["Alice", "Bob", "Carol"])),
+                Arc::new(Int64Array::from(vec![28, 34, 29])),
+            ],
+        )
+        .unwrap();
+
+        // Create SessionContext and register data source
+        let mem_table =
+            Arc::new(MemTable::try_new(schema.clone(), vec![vec![batch.clone()]]).unwrap());
+        let ctx = SessionContext::new();
+        ctx.register_table("Person", mem_table).unwrap();
+
+        // Create query
+        let cfg = GraphConfig::builder()
+            .with_node_label("Person", "id")
+            .build()
+            .unwrap();
+
+        let query = CypherQuery::new("MATCH (p:Person) RETURN p.name")
+            .unwrap()
+            .with_config(cfg);
+
+        // Execute with context (catalog built automatically)
+        let result = query.execute_with_datafusion_context(ctx).await.unwrap();
+
+        // Verify results
+        assert_eq!(result.num_rows(), 3);
+        assert_eq!(result.num_columns(), 1);
+
+        let names = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(names.value(0), "Alice");
+        assert_eq!(names.value(1), "Bob");
+        assert_eq!(names.value(2), "Carol");
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_context_with_filter() {
+        use arrow_array::{Int64Array, RecordBatch, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        use datafusion::datasource::MemTable;
+        use datafusion::execution::context::SessionContext;
+        use std::sync::Arc;
+
+        // Create test data
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("age", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
+                Arc::new(StringArray::from(vec!["Alice", "Bob", "Carol", "David"])),
+                Arc::new(Int64Array::from(vec![28, 34, 29, 42])),
+            ],
+        )
+        .unwrap();
+
+        // Create SessionContext
+        let mem_table =
+            Arc::new(MemTable::try_new(schema.clone(), vec![vec![batch.clone()]]).unwrap());
+        let ctx = SessionContext::new();
+        ctx.register_table("Person", mem_table).unwrap();
+
+        // Create query with filter
+        let cfg = GraphConfig::builder()
+            .with_node_label("Person", "id")
+            .build()
+            .unwrap();
+
+        let query = CypherQuery::new("MATCH (p:Person) WHERE p.age > 30 RETURN p.name, p.age")
+            .unwrap()
+            .with_config(cfg);
+
+        // Execute with context
+        let result = query.execute_with_datafusion_context(ctx).await.unwrap();
+
+        // Verify: should return Bob (34) and David (42)
+        assert_eq!(result.num_rows(), 2);
+        assert_eq!(result.num_columns(), 2);
+
+        let names = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let ages = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+
+        let results: Vec<(String, i64)> = (0..result.num_rows())
+            .map(|i| (names.value(i).to_string(), ages.value(i)))
+            .collect();
+
+        assert!(results.contains(&("Bob".to_string(), 34)));
+        assert!(results.contains(&("David".to_string(), 42)));
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_context_relationship_traversal() {
+        use arrow_array::{Int64Array, RecordBatch, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        use datafusion::datasource::MemTable;
+        use datafusion::execution::context::SessionContext;
+        use std::sync::Arc;
+
+        // Create Person nodes
+        let person_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let person_batch = RecordBatch::try_new(
+            person_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["Alice", "Bob", "Carol"])),
+            ],
+        )
+        .unwrap();
+
+        // Create KNOWS relationships
+        let knows_schema = Arc::new(Schema::new(vec![
+            Field::new("src_id", DataType::Int64, false),
+            Field::new("dst_id", DataType::Int64, false),
+            Field::new("since", DataType::Int64, false),
+        ]));
+        let knows_batch = RecordBatch::try_new(
+            knows_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(Int64Array::from(vec![2, 3])),
+                Arc::new(Int64Array::from(vec![2020, 2021])),
+            ],
+        )
+        .unwrap();
+
+        // Create SessionContext and register tables
+        let person_table = Arc::new(
+            MemTable::try_new(person_schema.clone(), vec![vec![person_batch.clone()]]).unwrap(),
+        );
+        let knows_table = Arc::new(
+            MemTable::try_new(knows_schema.clone(), vec![vec![knows_batch.clone()]]).unwrap(),
+        );
+
+        let ctx = SessionContext::new();
+        ctx.register_table("Person", person_table).unwrap();
+        ctx.register_table("KNOWS", knows_table).unwrap();
+
+        // Create query
+        let cfg = GraphConfig::builder()
+            .with_node_label("Person", "id")
+            .with_relationship("KNOWS", "src_id", "dst_id")
+            .build()
+            .unwrap();
+
+        let query = CypherQuery::new("MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name, b.name")
+            .unwrap()
+            .with_config(cfg);
+
+        // Execute with context
+        let result = query.execute_with_datafusion_context(ctx).await.unwrap();
+
+        // Verify: should return 2 relationships (Alice->Bob, Bob->Carol)
+        assert_eq!(result.num_rows(), 2);
+        assert_eq!(result.num_columns(), 2);
+
+        let src_names = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let dst_names = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+
+        let relationships: Vec<(String, String)> = (0..result.num_rows())
+            .map(|i| {
+                (
+                    src_names.value(i).to_string(),
+                    dst_names.value(i).to_string(),
+                )
+            })
+            .collect();
+
+        assert!(relationships.contains(&("Alice".to_string(), "Bob".to_string())));
+        assert!(relationships.contains(&("Bob".to_string(), "Carol".to_string())));
+    }
+
+    #[tokio::test]
+    async fn test_execute_with_context_order_by_limit() {
+        use arrow_array::{Int64Array, RecordBatch, StringArray};
+        use arrow_schema::{DataType, Field, Schema};
+        use datafusion::datasource::MemTable;
+        use datafusion::execution::context::SessionContext;
+        use std::sync::Arc;
+
+        // Create test data
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+            Field::new("score", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
+                Arc::new(StringArray::from(vec!["Alice", "Bob", "Carol", "David"])),
+                Arc::new(Int64Array::from(vec![85, 92, 78, 95])),
+            ],
+        )
+        .unwrap();
+
+        // Create SessionContext
+        let mem_table =
+            Arc::new(MemTable::try_new(schema.clone(), vec![vec![batch.clone()]]).unwrap());
+        let ctx = SessionContext::new();
+        ctx.register_table("Student", mem_table).unwrap();
+
+        // Create query with ORDER BY and LIMIT
+        let cfg = GraphConfig::builder()
+            .with_node_label("Student", "id")
+            .build()
+            .unwrap();
+
+        let query = CypherQuery::new(
+            "MATCH (s:Student) RETURN s.name, s.score ORDER BY s.score DESC LIMIT 2",
+        )
+        .unwrap()
+        .with_config(cfg);
+
+        // Execute with context
+        let result = query.execute_with_datafusion_context(ctx).await.unwrap();
+
+        // Verify: should return top 2 scores (David: 95, Bob: 92)
+        assert_eq!(result.num_rows(), 2);
+        assert_eq!(result.num_columns(), 2);
+
+        let names = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let scores = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+
+        // First row should be David (95)
+        assert_eq!(names.value(0), "David");
+        assert_eq!(scores.value(0), 95);
+
+        // Second row should be Bob (92)
+        assert_eq!(names.value(1), "Bob");
+        assert_eq!(scores.value(1), 92);
     }
 }
