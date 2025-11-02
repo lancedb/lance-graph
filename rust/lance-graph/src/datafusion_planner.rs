@@ -372,11 +372,13 @@ impl DataFusionPlanner {
                     .iter()
                     .map(|p| {
                         let expr = self.to_df_value_expr(&p.expression);
-                        // Apply alias if provided
+                        // Apply alias if provided, otherwise use Cypher dot notation
                         if let Some(alias) = &p.alias {
                             expr.alias(alias)
                         } else {
-                            expr
+                            // Convert to Cypher dot notation (e.g., p__name -> p.name)
+                            let cypher_name = self.to_cypher_column_name(&p.expression);
+                            expr.alias(cypher_name)
                         }
                     })
                     .collect();
@@ -1433,6 +1435,33 @@ impl DataFusionPlanner {
             VE::Function { .. } | VE::Arithmetic { .. } => lit(0),
         }
     }
+
+    /// Convert a ValueExpression to Cypher dot notation for column naming
+    ///
+    /// This generates user-friendly column names following Cypher conventions:
+    /// - Property references: `p.name` (variable.property)
+    /// - Other expressions: Use the expression as-is
+    ///
+    /// This is used when no explicit alias is provided in RETURN clauses.
+    fn to_cypher_column_name(&self, expr: &crate::ast::ValueExpression) -> String {
+        use crate::ast::ValueExpression as VE;
+        match expr {
+            VE::Property(prop) => {
+                // Convert to Cypher dot notation: variable.property
+                format!("{}.{}", prop.variable, prop.property)
+            }
+            VE::Variable(v) => v.clone(),
+            VE::Literal(crate::ast::PropertyValue::Property(prop)) => {
+                // Handle nested property references
+                format!("{}.{}", prop.variable, prop.property)
+            }
+            _ => {
+                // For other expressions (literals, functions), use a generic name
+                // In practice, these should always have explicit aliases
+                "expr".to_string()
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1549,7 +1578,7 @@ mod tests {
     }
 
     #[test]
-    fn test_df_planner_property_pushdown_filter() {
+    fn test_df_planner_inline_property_filter() {
         let mut props = std::collections::HashMap::new();
         props.insert(
             "name".to_string(),
@@ -3039,6 +3068,156 @@ mod tests {
             result.is_ok(),
             "Should handle source variables with underscores: {:?}",
             result.err()
+        );
+    }
+
+    #[test]
+    fn test_cypher_dot_notation_simple_property() {
+        // Test that projections without aliases use Cypher dot notation
+        let cfg = crate::config::GraphConfig::builder()
+            .with_node_label("Person", "id")
+            .build()
+            .unwrap();
+
+        let planner = DataFusionPlanner::with_catalog(cfg, make_catalog());
+
+        let scan = LogicalOperator::ScanByLabel {
+            variable: "p".to_string(),
+            label: "Person".to_string(),
+            properties: Default::default(),
+        };
+
+        // Project without alias - should use Cypher dot notation
+        let project = LogicalOperator::Project {
+            input: Box::new(scan),
+            projections: vec![ProjectionItem {
+                expression: ValueExpression::Property(PropertyRef {
+                    variable: "p".to_string(),
+                    property: "name".to_string(),
+                }),
+                alias: None, // No explicit alias
+            }],
+        };
+
+        let df_plan = planner.plan(&project).unwrap();
+        let plan_str = format!("{:?}", df_plan);
+
+        // Should contain Cypher dot notation "p.name", not "p__name"
+        assert!(
+            plan_str.contains("p.name"),
+            "Plan should contain Cypher dot notation 'p.name': {}",
+            plan_str
+        );
+        assert!(
+            !plan_str.contains("p__name AS"),
+            "Plan should not contain DataFusion qualified name 'p__name AS': {}",
+            plan_str
+        );
+    }
+
+    #[test]
+    fn test_cypher_dot_notation_multiple_properties() {
+        // Test multiple properties from the same variable
+        let cfg = crate::config::GraphConfig::builder()
+            .with_node_label("Person", "id")
+            .build()
+            .unwrap();
+
+        let planner = DataFusionPlanner::with_catalog(cfg, make_catalog());
+
+        let scan = LogicalOperator::ScanByLabel {
+            variable: "p".to_string(),
+            label: "Person".to_string(),
+            properties: Default::default(),
+        };
+
+        // Project multiple properties without aliases
+        let project = LogicalOperator::Project {
+            input: Box::new(scan),
+            projections: vec![
+                ProjectionItem {
+                    expression: ValueExpression::Property(PropertyRef {
+                        variable: "p".to_string(),
+                        property: "name".to_string(),
+                    }),
+                    alias: None,
+                },
+                ProjectionItem {
+                    expression: ValueExpression::Property(PropertyRef {
+                        variable: "p".to_string(),
+                        property: "age".to_string(),
+                    }),
+                    alias: None,
+                },
+            ],
+        };
+
+        let df_plan = planner.plan(&project).unwrap();
+        let plan_str = format!("{:?}", df_plan);
+
+        // Should contain both Cypher dot notations
+        assert!(
+            plan_str.contains("p.name"),
+            "Plan should contain 'p.name': {}",
+            plan_str
+        );
+        assert!(
+            plan_str.contains("p.age"),
+            "Plan should contain 'p.age': {}",
+            plan_str
+        );
+    }
+
+    #[test]
+    fn test_cypher_dot_notation_mixed_with_and_without_alias() {
+        // Test mix of aliased and non-aliased projections
+        let cfg = crate::config::GraphConfig::builder()
+            .with_node_label("Person", "id")
+            .build()
+            .unwrap();
+
+        let planner = DataFusionPlanner::with_catalog(cfg, make_catalog());
+
+        let scan = LogicalOperator::ScanByLabel {
+            variable: "p".to_string(),
+            label: "Person".to_string(),
+            properties: Default::default(),
+        };
+
+        let project = LogicalOperator::Project {
+            input: Box::new(scan),
+            projections: vec![
+                ProjectionItem {
+                    expression: ValueExpression::Property(PropertyRef {
+                        variable: "p".to_string(),
+                        property: "name".to_string(),
+                    }),
+                    alias: Some("full_name".to_string()), // Explicit alias
+                },
+                ProjectionItem {
+                    expression: ValueExpression::Property(PropertyRef {
+                        variable: "p".to_string(),
+                        property: "age".to_string(),
+                    }),
+                    alias: None, // No alias - should use dot notation
+                },
+            ],
+        };
+
+        let df_plan = planner.plan(&project).unwrap();
+        let plan_str = format!("{:?}", df_plan);
+
+        // Should contain explicit alias
+        assert!(
+            plan_str.contains("full_name"),
+            "Plan should contain explicit alias 'full_name': {}",
+            plan_str
+        );
+        // Should contain Cypher dot notation for non-aliased property
+        assert!(
+            plan_str.contains("p.age"),
+            "Plan should contain Cypher dot notation 'p.age': {}",
+            plan_str
         );
     }
 
