@@ -1395,22 +1395,22 @@ async fn test_datafusion_varlength_projection_correctness() {
     // Total: 4 results (Bob, Charlie, Charlie, David)
     assert_eq!(out.num_rows(), 4);
 
-    // Verify schema only contains source and target columns, not intermediate nodes
+    // Verify schema only contains the requested column (now in Cypher dot notation)
     let schema = out.schema();
     let column_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
 
-    // Should only have b__ prefixed columns (target), no intermediate node columns
+    // Should only have the 'b.name' column (Cypher dot notation)
+    assert_eq!(column_names.len(), 1);
+    assert_eq!(
+        column_names[0], "b.name",
+        "Expected Cypher dot notation 'b.name' column"
+    );
+
+    // Verify no DataFusion qualified names remain (no __)
     for name in &column_names {
         assert!(
-            name.starts_with("b__"),
-            "Unexpected column in variable-length result: {}",
-            name
-        );
-        // Ensure no double-qualified names like "b__intermediate__prop"
-        let remainder = &name[3..]; // Skip "b__"
-        assert!(
-            !remainder.contains("__"),
-            "Column name contains nested qualifiers: {}",
+            !name.contains("__"),
+            "Column name should not contain DataFusion qualifiers: {}",
             name
         );
     }
@@ -1911,7 +1911,7 @@ async fn test_datafusion_return_mixed_with_and_without_alias() {
     let schema = out.schema();
     assert_eq!(schema.fields().len(), 2);
     assert_eq!(schema.field(0).name(), "full_name"); // Aliased
-    assert_eq!(schema.field(1).name(), "p__age"); // Not aliased - qualified name
+    assert_eq!(schema.field(1).name(), "p.age"); // Not aliased - Cypher dot notation
 }
 
 #[tokio::test]
