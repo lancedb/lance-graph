@@ -62,37 +62,55 @@ def graph_env(tmp_path):
     return config, datasets, people_table
 
 
-def test_basic_node_selection(graph_env):
+@pytest.mark.parametrize("execute_method", ["execute", "execute_datafusion"])
+def test_basic_node_selection(graph_env, execute_method):
     config, datasets, _ = graph_env
     query = CypherQuery("MATCH (p:Person) RETURN p.name, p.age").with_config(config)
-    result = query.execute({"Person": datasets["Person"]})
+    result = getattr(query, execute_method)({"Person": datasets["Person"]})
     data = result.to_pydict()
-    assert len(data["name"]) == 4
-    assert set(data.keys()) == {"name", "age"}
-    assert "Alice" in set(data["name"])
+
+    # TODO: remove this if/else statements when the execute() also returns
+    # Cypher dot notation
+    if execute_method == "execute":
+        # execute() returns unqualified names for simple queries
+        assert set(data.keys()) == {"name", "age"}
+        assert len(data["name"]) == 4
+        assert "Alice" in set(data["name"])
+    else:
+        # execute_datafusion() returns Cypher dot notation
+        assert set(data.keys()) == {"p.name", "p.age"}
+        assert len(data["p.name"]) == 4
+        assert "Alice" in set(data["p.name"])
 
 
-def test_filtered_query(graph_env):
+@pytest.mark.parametrize("execute_method", ["execute", "execute_datafusion"])
+def test_filtered_query(graph_env, execute_method):
     config, datasets, _ = graph_env
     query = CypherQuery(
         "MATCH (p:Person) WHERE p.age > 30 RETURN p.name, p.age"
     ).with_config(config)
-    result = query.execute({"Person": datasets["Person"]})
+    result = getattr(query, execute_method)({"Person": datasets["Person"]})
     data = result.to_pydict()
-    assert len(data["name"]) == 2
-    assert set(data["name"]) == {"Bob", "David"}
-    assert all(age > 30 for age in data["age"])
+
+    if execute_method == "execute":
+        assert len(data["name"]) == 2
+        assert set(data["name"]) == {"Bob", "David"}
+        assert all(age > 30 for age in data["age"])
+    else:
+        assert len(data["p.name"]) == 2
+        assert set(data["p.name"]) == {"Bob", "David"}
+        assert all(age > 30 for age in data["p.age"])
 
 
-def test_relationship_query(graph_env):
+@pytest.mark.parametrize("execute_method", ["execute", "execute_datafusion"])
+def test_relationship_query(graph_env, execute_method):
     config, datasets, _ = graph_env
-    # Alias outputs to stable column names regardless of internal qualification
     query = CypherQuery(
         "MATCH (p:Person)-[:WORKS_FOR]->(c:Company) "
         "RETURN p.person_id AS person_id, p.name AS name, c.company_id AS company_id"
     ).with_config(config)
 
-    result = query.execute(
+    result = getattr(query, execute_method)(
         {
             "Person": datasets["Person"],
             "Company": datasets["Company"],
@@ -105,7 +123,8 @@ def test_relationship_query(graph_env):
     assert data["company_id"] == [101, 101, 102, 103]
 
 
-def test_friendship_direct_and_network(graph_env):
+@pytest.mark.parametrize("execute_method", ["execute", "execute_datafusion"])
+def test_friendship_direct_and_network(graph_env, execute_method):
     config, datasets, _ = graph_env
     # Direct friends of Alice (person_id = 1)
     query_direct = CypherQuery(
@@ -114,7 +133,7 @@ def test_friendship_direct_and_network(graph_env):
         "RETURN b.person_id AS friend_id"
     ).with_config(config)
 
-    result_direct = query_direct.execute(
+    result_direct = getattr(query_direct, execute_method)(
         {
             "Person": datasets["Person"],
             "FRIEND_OF": datasets["FRIEND_OF"],
@@ -129,7 +148,7 @@ def test_friendship_direct_and_network(graph_env):
         "RETURN f.person_id AS person1_id, t.person_id AS person2_id"
     ).with_config(config)
 
-    result_edges = query_edges.execute(
+    result_edges = getattr(query_edges, execute_method)(
         {
             "Person": datasets["Person"],
             "FRIEND_OF": datasets["FRIEND_OF"],
@@ -140,7 +159,8 @@ def test_friendship_direct_and_network(graph_env):
     assert got == {(1, 2), (1, 3), (2, 4), (3, 4)}
 
 
-def test_two_hop_friends_of_friends(graph_env):
+@pytest.mark.parametrize("execute_method", ["execute", "execute_datafusion"])
+def test_two_hop_friends_of_friends(graph_env, execute_method):
     config, datasets, _ = graph_env
     query = CypherQuery(
         "MATCH (a:Person)-[:FRIEND_OF]->(b:Person)-[:FRIEND_OF]->(c:Person) "
@@ -148,7 +168,7 @@ def test_two_hop_friends_of_friends(graph_env):
         "RETURN a.person_id AS a_id, b.person_id AS b_id, c.person_id AS c_id"
     ).with_config(config)
 
-    result = query.execute(
+    result = getattr(query, execute_method)(
         {
             "Person": datasets["Person"],
             "FRIEND_OF": datasets["FRIEND_OF"],
@@ -158,15 +178,42 @@ def test_two_hop_friends_of_friends(graph_env):
     assert set(data["c_id"]) == {4}
 
 
-def test_variable_length_path(graph_env):
+@pytest.mark.parametrize("execute_method", ["execute", "execute_datafusion"])
+def test_variable_length_path(graph_env, execute_method):
     config, datasets, _ = graph_env
     query = CypherQuery(
         "MATCH (p1:Person)-[:FRIEND_OF*1..2]-(p2:Person) "
         "RETURN p1.person_id AS p1, p2.person_id AS p2"
     ).with_config(config)
-    _ = query.execute(
+    _ = getattr(query, execute_method)(
         {
             "Person": datasets["Person"],
             "FRIEND_OF": datasets["FRIEND_OF"],
         }
     )
+
+
+@pytest.mark.parametrize("execute_method", ["execute", "execute_datafusion"])
+def test_distinct_clause(graph_env, execute_method):
+    config, datasets, _ = graph_env
+    query = CypherQuery(
+        "MATCH (p:Person)-[:WORKS_FOR]->(c:Company) RETURN DISTINCT c.company_name"
+    ).with_config(config)
+
+    result = getattr(query, execute_method)(
+        {
+            "Person": datasets["Person"],
+            "Company": datasets["Company"],
+            "WORKS_FOR": datasets["WORKS_FOR"],
+        }
+    )
+    data = result.to_pydict()
+
+    if execute_method == "execute":
+        # execute() returns qualified column names for relationship queries
+        assert len(data["c__company_name"]) == 3
+        assert set(data["c__company_name"]) == {"TechCorp", "DataInc", "CloudSoft"}
+    else:
+        # execute_datafusion() returns Cypher dot notation
+        assert len(data["c.company_name"]) == 3
+        assert set(data["c.company_name"]) == {"TechCorp", "DataInc", "CloudSoft"}
