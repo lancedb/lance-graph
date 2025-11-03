@@ -292,6 +292,74 @@ impl CypherQuery {
         record_batch_to_python_table(py, &result_batch)
     }
 
+    /// Execute query using the DataFusion planner with in-memory datasets
+    ///
+    /// Parameters
+    /// ----------
+    /// datasets : dict
+    ///     Dictionary mapping table names to in-memory tables (pyarrow.Table, LanceDataset, etc.)
+    ///     Keys should match node labels and relationship types in the graph config.
+    ///
+    /// Returns
+    /// -------
+    /// pyarrow.Table
+    ///     Query results as Arrow table
+    ///
+    /// Raises
+    /// ------
+    /// ValueError
+    ///     If the query is invalid or datasets are missing
+    /// RuntimeError
+    ///     If query execution fails
+    fn execute_datafusion(&self, py: Python, datasets: &Bound<'_, PyDict>) -> PyResult<PyObject> {
+        // Convert datasets to Arrow RecordBatch map
+        let arrow_datasets = python_datasets_to_batches(datasets)?;
+
+        // Clone for async move
+        let inner_query = self.inner.clone();
+
+        // Execute via runtime
+        let result_batch = RT
+            .block_on(Some(py), inner_query.execute_datafusion(arrow_datasets))?
+            .map_err(graph_error_to_pyerr)?;
+
+        record_batch_to_python_table(py, &result_batch)
+    }
+
+    /// Explain query uusing the DataFusion planner with in-memory datasets
+    ///
+    /// Parameters
+    /// ----------
+    /// datasets : dict
+    ///     Dictionary mapping table names to in-memory tables (pyarrow.Table, LanceDataset, etc.)
+    ///     Keys should match node labels and relationship types in the graph config.
+    ///
+    /// Returns
+    /// -------
+    /// str
+    ///     Query graph logical plan, DataFusion logical plan, DataFusion physical plan as string
+    ///
+    /// Raises
+    /// ------
+    /// ValueError
+    ///     If the query is invalid or datasets are missing
+    /// RuntimeError
+    ///     If query explain fails
+    fn explain_datafusion(&self, py: Python, datasets: &Bound<'_, PyDict>) -> PyResult<String> {
+        // Convert datasets to Arrow RecordBatch map
+        let arrow_datasets = python_datasets_to_batches(datasets)?;
+
+        // Clone for async move
+        let inner_query = self.inner.clone();
+
+        // Execute via runtime
+        let plan = RT
+            .block_on(Some(py), inner_query.explain_datafusion(arrow_datasets))?
+            .map_err(graph_error_to_pyerr)?;
+
+        Ok(plan)
+    }
+
     /// Get variables used in the query
     fn variables(&self) -> Vec<String> {
         self.inner.variables()
