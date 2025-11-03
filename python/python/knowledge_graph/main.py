@@ -60,7 +60,6 @@ relationship_types: []
     print(f"Created schema template at {schema_path}")
 
 
-
 def ask_question(
     question: str,
     service: "LanceKnowledgeGraph",
@@ -78,7 +77,6 @@ def ask_question(
         embedding_model=getattr(args, "embedding_model", None),
     )
     print(answer)
-
 
 
 def _load_config(args: "argparse.Namespace") -> "KnowledgeGraphConfig":

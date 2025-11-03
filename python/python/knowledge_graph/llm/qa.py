@@ -87,7 +87,9 @@ def ask_question(
     plan_payload = kg_extraction.parse_llm_json(raw_plan)
     query_plan: list[PlanStep] = extract_query_plan(plan_payload)
     if allowed_relationship_types and query_plan:
-        query_plan = _normalize_relationship_types(query_plan, allowed_relationship_types)
+        query_plan = _normalize_relationship_types(
+            query_plan, allowed_relationship_types
+        )
         # Log normalized cypher for debugging
         for step in query_plan:
             LOGGER.debug("Normalized Cypher: %s", step.get("cypher"))
