@@ -15,7 +15,10 @@ def _load_bindings() -> ModuleType:
     try:
         from . import _internal as bindings  # type: ignore[attr-defined]
     except ImportError:
-        bindings = _load_dev_build()
+        try:
+            import _internal as bindings  # type: ignore[import-not-found]
+        except ImportError:
+            bindings = _load_dev_build()
     return bindings
 
 
