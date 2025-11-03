@@ -295,6 +295,8 @@ name = "lance-graph"
 source = { editable = "." }
 dependencies = [
     { name = "fastapi" },
+    { name = "lance" },
+    { name = "openai" },
     { name = "pyarrow" },
     { name = "pydantic" },
     { name = "pyyaml" },
@@ -306,12 +308,6 @@ dev = [
     { name = "pyright" },
     { name = "ruff" },
 ]
-lance-storage = [
-    { name = "lance" },
-]
-llm = [
-    { name = "openai" },
-]
 tests = [
     { name = "pandas" },
     { name = "pyarrow" },
@@ -322,8 +318,8 @@ tests = [
 [package.metadata]
 requires-dist = [
     { name = "fastapi", specifier = ">=0.104.0" },
-    { name = "lance", marker = "extra == 'lance-storage'", specifier = ">=0.17.0" },
-    { name = "openai", marker = "extra == 'llm'", specifier = ">=1.52.0" },
+    { name = "lance", specifier = ">=0.17.0" },
+    { name = "openai", specifier = ">=1.52.0" },
     { name = "pandas", marker = "extra == 'tests'" },
     { name = "pyarrow", specifier = ">=14" },
     { name = "pyarrow", marker = "extra == 'tests'", specifier = ">=14" },
@@ -335,7 +331,7 @@ requires-dist = [
     { name = "ruff", marker = "extra == 'tests'" },
     { name = "uvicorn", specifier = ">=0.24.0" },
 ]
-provides-extras = ["tests", "dev", "llm", "lance-storage"]
+provides-extras = ["tests", "dev"]
 
 [[package]]
 name = "nodeenv"

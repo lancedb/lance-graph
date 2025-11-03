@@ -7,6 +7,8 @@ dependencies = [
     "fastapi>=0.104.0",
     "uvicorn>=0.24.0",
     "pydantic>=2.0.0",
+    "openai>=1.52.0",
+    "lance>=0.17.0",
 ]
 description = "Python bindings for the lance-graph Cypher engine"
 authors = [{ name = "Lance Devs", email = "dev@lancedb.com" }]
@@ -43,8 +45,6 @@ build-backend = "maturin"
 [project.optional-dependencies]
 tests = ["pytest", "pyarrow>=14", "pandas", "ruff"]
 dev = ["ruff", "pyright"]
-llm = ["openai>=1.52.0"]
-lance-storage = ["lance>=0.17.0"]
 
 [project.scripts]
 knowledge_graph = "knowledge_graph.main:main"
