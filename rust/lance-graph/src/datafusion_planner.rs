@@ -513,9 +513,8 @@ impl DataFusionPlanner {
                     let filter_exprs: Vec<Expr> = properties
                         .iter()
                         .map(|(k, v)| {
-                            let lit_expr = self.to_df_value_expr(
-                                &crate::ast::ValueExpression::Literal(v.clone()),
-                            );
+                            let lit_expr = self
+                                .to_df_value_expr(&crate::ast::ValueExpression::Literal(v.clone()));
                             Expr::BinaryExpr(BinaryExpr {
                                 left: Box::new(col(k)),
                                 op: Operator::Eq,
@@ -536,9 +535,9 @@ impl DataFusionPlanner {
                         })
                         .unwrap();
 
-                    builder = builder.filter(combined_filter).map_err(|e| {
-                        self.plan_error("Failed to apply property filters", e)
-                    })?;
+                    builder = builder
+                        .filter(combined_filter)
+                        .map_err(|e| self.plan_error("Failed to apply property filters", e))?;
                 }
 
                 // Create qualified column aliases: variable__property
