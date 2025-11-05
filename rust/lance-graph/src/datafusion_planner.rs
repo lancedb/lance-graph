@@ -508,26 +508,49 @@ impl DataFusionPlanner {
                     self.plan_error(&format!("Failed to scan node source '{}'", label), e)
                 })?;
 
-                // Apply property filters using unqualified names (before aliasing)
-                for (k, v) in properties.iter() {
-                    let lit_expr =
-                        self.to_df_value_expr(&crate::ast::ValueExpression::Literal(v.clone()));
-                    let filter_expr = Expr::BinaryExpr(BinaryExpr {
-                        left: Box::new(col(k)),
-                        op: Operator::Eq,
-                        right: Box::new(lit_expr),
-                    });
-                    builder = builder.filter(filter_expr).map_err(|e| {
-                        self.plan_error(&format!("Failed to apply filter on property '{}'", k), e)
-                    })?;
+                // Combine property filters into single predicate for efficiency
+                if !properties.is_empty() {
+                    let filter_exprs: Vec<Expr> = properties
+                        .iter()
+                        .map(|(k, v)| {
+                            let lit_expr = self
+                                .to_df_value_expr(&crate::ast::ValueExpression::Literal(v.clone()));
+                            Expr::BinaryExpr(BinaryExpr {
+                                left: Box::new(col(k)),
+                                op: Operator::Eq,
+                                right: Box::new(lit_expr),
+                            })
+                        })
+                        .collect();
+
+                    // Combine with AND if multiple filters
+                    let combined_filter = filter_exprs
+                        .into_iter()
+                        .reduce(|acc, expr| {
+                            Expr::BinaryExpr(BinaryExpr {
+                                left: Box::new(acc),
+                                op: Operator::And,
+                                right: Box::new(expr),
+                            })
+                        })
+                        .unwrap();
+
+                    builder = builder
+                        .filter(combined_filter)
+                        .map_err(|e| self.plan_error("Failed to apply property filters", e))?;
                 }
 
                 // Create qualified column aliases: variable__property
+                // Optimization: Pre-allocate string capacity to reduce allocations
                 let qualified_exprs: Vec<Expr> = schema
                     .fields()
                     .iter()
                     .map(|field| {
-                        let qualified_name = format!("{}__{}", variable, field.name());
+                        let mut qualified_name =
+                            String::with_capacity(variable.len() + field.name().len() + 2);
+                        qualified_name.push_str(variable);
+                        qualified_name.push_str("__");
+                        qualified_name.push_str(field.name());
                         col(field.name()).alias(&qualified_name)
                     })
                     .collect();
