@@ -360,10 +360,54 @@ fn comparison_operator(input: &str) -> IResult<&str, ComparisonOperator> {
 // Parse a value expression
 fn value_expression(input: &str) -> IResult<&str, ValueExpression> {
     alt((
+        function_call,
         map(property_reference, ValueExpression::Property),
         map(property_value, ValueExpression::Literal),
         map(identifier, |id| ValueExpression::Variable(id.to_string())),
     ))(input)
+}
+
+// Parse a function call: function_name(args)
+fn function_call(input: &str) -> IResult<&str, ValueExpression> {
+    let (input, name) = identifier(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = char('(')(input)?;
+    let (input, _) = multispace0(input)?;
+
+    // Handle COUNT(*) special case - only allow * for COUNT function
+    if let Ok((input_after_star, _)) = char::<_, nom::error::Error<&str>>('*')(input) {
+        // Validate that this is COUNT function
+        if name.to_lowercase() == "count" {
+            let (input, _) = multispace0(input_after_star)?;
+            let (input, _) = char(')')(input)?;
+            return Ok((
+                input,
+                ValueExpression::Function {
+                    name: name.to_string(),
+                    args: vec![ValueExpression::Variable("*".to_string())],
+                },
+            ));
+        } else {
+            // Not COUNT - fail parsing to try regular argument parsing
+            // This will naturally fail since * is not a valid value_expression
+        }
+    }
+
+    // Parse regular function arguments
+    let (input, args) = separated_list0(
+        tuple((multispace0, char(','), multispace0)),
+        value_expression,
+    )(input)?;
+    let (input, _) = multispace0(input)?;
+    let (input, _) = char(')')(input)?;
+
+    Ok((
+        input,
+        ValueExpression::Function {
+            name: name.to_string(),
+            args,
+        },
+    ))
 }
 
 fn value_expression_list(input: &str) -> IResult<&str, Vec<ValueExpression>> {
@@ -827,5 +871,81 @@ mod tests {
         assert_eq!(result.skip, Some(5));
         assert_eq!(result.limit, Some(10));
         assert!(result.order_by.is_some());
+    }
+
+    #[test]
+    fn test_parse_count_star() {
+        let query = "MATCH (n:Person) RETURN count(*) AS total";
+        let result = parse_cypher_query(query).unwrap();
+
+        assert_eq!(result.return_clause.items.len(), 1);
+        let item = &result.return_clause.items[0];
+        assert_eq!(item.alias, Some("total".to_string()));
+
+        match &item.expression {
+            ValueExpression::Function { name, args } => {
+                assert_eq!(name, "count");
+                assert_eq!(args.len(), 1);
+                match &args[0] {
+                    ValueExpression::Variable(v) => assert_eq!(v, "*"),
+                    _ => panic!("Expected Variable(*) in count(*)"),
+                }
+            }
+            _ => panic!("Expected Function expression"),
+        }
+    }
+
+    #[test]
+    fn test_parse_count_property() {
+        let query = "MATCH (n:Person) RETURN count(n.age)";
+        let result = parse_cypher_query(query).unwrap();
+
+        assert_eq!(result.return_clause.items.len(), 1);
+        let item = &result.return_clause.items[0];
+
+        match &item.expression {
+            ValueExpression::Function { name, args } => {
+                assert_eq!(name, "count");
+                assert_eq!(args.len(), 1);
+                match &args[0] {
+                    ValueExpression::Property(prop) => {
+                        assert_eq!(prop.variable, "n");
+                        assert_eq!(prop.property, "age");
+                    }
+                    _ => panic!("Expected Property in count(n.age)"),
+                }
+            }
+            _ => panic!("Expected Function expression"),
+        }
+    }
+
+    #[test]
+    fn test_parse_non_count_function_rejects_star() {
+        // FOO(*) should fail to parse since * is only allowed for COUNT
+        let query = "MATCH (n:Person) RETURN foo(*)";
+        let result = parse_cypher_query(query);
+        assert!(result.is_err(), "foo(*) should not parse successfully");
+    }
+
+    #[test]
+    fn test_parse_count_with_multiple_args() {
+        // COUNT with multiple arguments parses successfully
+        // but will be rejected during semantic validation
+        let query = "MATCH (n:Person) RETURN count(n.age, n.name)";
+        let result = parse_cypher_query(query);
+        assert!(
+            result.is_ok(),
+            "Parser should accept multiple args (validation happens in semantic phase)"
+        );
+
+        // Verify the AST structure
+        let ast = result.unwrap();
+        match &ast.return_clause.items[0].expression {
+            ValueExpression::Function { name, args } => {
+                assert_eq!(name, "count");
+                assert_eq!(args.len(), 2);
+            }
+            _ => panic!("Expected Function expression"),
+        }
     }
 }
