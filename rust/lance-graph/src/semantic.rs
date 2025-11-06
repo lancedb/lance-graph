@@ -268,7 +268,27 @@ impl SemanticAnalyzer {
                     });
                 }
             }
-            ValueExpression::Function { args, .. } => {
+            ValueExpression::Function { name, args } => {
+                // Validate function-specific arity and signature rules
+                match name.to_lowercase().as_str() {
+                    "count" | "sum" | "avg" | "min" | "max" => {
+                        if args.len() != 1 {
+                            return Err(GraphError::PlanError {
+                                message: format!(
+                                    "{} requires exactly 1 argument, got {}",
+                                    name.to_uppercase(),
+                                    args.len()
+                                ),
+                                location: snafu::Location::new(file!(), line!(), column!()),
+                            });
+                        }
+                    }
+                    _ => {
+                        // Other functions - no validation yet
+                    }
+                }
+
+                // Validate arguments recursively
                 for arg in args {
                     self.analyze_value_expression(arg)?;
                 }
@@ -872,6 +892,63 @@ mod tests {
             .errors
             .iter()
             .all(|e| !e.contains("Undefined variable: 'n'")));
+    }
+
+    #[test]
+    fn test_count_with_multiple_args_fails_validation() {
+        // COUNT(n.age, n.name) should fail semantic validation
+        let expr = ValueExpression::Function {
+            name: "count".to_string(),
+            args: vec![
+                ValueExpression::Property(PropertyRef::new("n", "age")),
+                ValueExpression::Property(PropertyRef::new("n", "name")),
+            ],
+        };
+        let result = analyze_return_with_match("n", "Person", expr).unwrap();
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.contains("COUNT requires exactly 1 argument")),
+            "Expected error about COUNT arity, got: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn test_count_with_zero_args_fails_validation() {
+        // COUNT() with no arguments should fail
+        let expr = ValueExpression::Function {
+            name: "count".to_string(),
+            args: vec![],
+        };
+        let result = analyze_return_with_match("n", "Person", expr).unwrap();
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.contains("COUNT requires exactly 1 argument")),
+            "Expected error about COUNT arity, got: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn test_count_with_one_arg_passes_validation() {
+        // COUNT(n.age) should pass validation
+        let expr = ValueExpression::Function {
+            name: "count".to_string(),
+            args: vec![ValueExpression::Property(PropertyRef::new("n", "age"))],
+        };
+        let result = analyze_return_with_match("n", "Person", expr).unwrap();
+        assert!(
+            result
+                .errors
+                .iter()
+                .all(|e| !e.contains("COUNT requires exactly 1 argument")),
+            "COUNT with 1 arg should not produce arity error, got: {:?}",
+            result.errors
+        );
     }
 
     #[test]

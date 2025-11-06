@@ -3267,6 +3267,7 @@ dependencies = [
  "datafusion",
  "datafusion-common",
  "datafusion-expr",
+ "datafusion-functions-aggregate",
  "datafusion-sql",
  "futures",
  "lance",
