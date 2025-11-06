@@ -2414,3 +2414,199 @@ async fn test_datafusion_varlength_count() {
     // Alice can reach 4 people within 2 hops
     assert_eq!(out.num_rows(), 4);
 }
+
+// ============================================================================
+// Aggregation Function Tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_count_star_all_nodes() {
+    let person_batch = create_person_dataset();
+    let config = GraphConfig::builder()
+        .with_node_label("Person", "id")
+        .build()
+        .unwrap();
+
+    let query = CypherQuery::new("MATCH (a:Person) RETURN count(*) AS total")
+        .unwrap()
+        .with_config(config);
+
+    let mut datasets = HashMap::new();
+    datasets.insert("Person".to_string(), person_batch);
+
+    let result = query.execute_datafusion(datasets).await.unwrap();
+
+    assert_eq!(result.num_rows(), 1);
+    let count_col = result
+        .column_by_name("total")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(count_col.value(0), 5);
+}
+
+#[tokio::test]
+async fn test_count_with_filter() {
+    let person_batch = create_person_dataset();
+    let config = GraphConfig::builder()
+        .with_node_label("Person", "id")
+        .build()
+        .unwrap();
+
+    let query =
+        CypherQuery::new("MATCH (a:Person) WHERE a.age > 30 RETURN count(*) AS older_than_30")
+            .unwrap()
+            .with_config(config);
+
+    let mut datasets = HashMap::new();
+    datasets.insert("Person".to_string(), person_batch);
+
+    let result = query.execute_datafusion(datasets).await.unwrap();
+
+    assert_eq!(result.num_rows(), 1);
+    let count_col = result
+        .column_by_name("older_than_30")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    // Bob (35) and David (40) are older than 30
+    assert_eq!(count_col.value(0), 2);
+}
+
+#[tokio::test]
+async fn test_count_property() {
+    let person_batch = create_person_dataset();
+    let config = GraphConfig::builder()
+        .with_node_label("Person", "id")
+        .build()
+        .unwrap();
+
+    let query = CypherQuery::new("MATCH (p:Person) RETURN count(p.name) AS person_count")
+        .unwrap()
+        .with_config(config);
+
+    let mut datasets = HashMap::new();
+    datasets.insert("Person".to_string(), person_batch);
+
+    let result = query.execute_datafusion(datasets).await.unwrap();
+
+    assert_eq!(result.num_rows(), 1);
+    let count_col = result
+        .column_by_name("person_count")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(count_col.value(0), 5);
+}
+
+#[tokio::test]
+async fn test_count_with_grouping() {
+    let person_batch = create_person_dataset();
+    let config = GraphConfig::builder()
+        .with_node_label("Person", "id")
+        .build()
+        .unwrap();
+
+    let query =
+        CypherQuery::new("MATCH (p:Person) RETURN p.city, count(*) AS count ORDER BY p.city")
+            .unwrap()
+            .with_config(config);
+
+    let mut datasets = HashMap::new();
+    datasets.insert("Person".to_string(), person_batch);
+
+    let result = query.execute_datafusion(datasets).await.unwrap();
+
+    // Should have 4 groups: NULL (David), Chicago, New York, San Francisco, Seattle
+    assert_eq!(result.num_rows(), 5);
+
+    let city_col = result
+        .column_by_name("p.city")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let count_col = result
+        .column_by_name("count")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+
+    // NULL city: 1 person (David)
+    assert!(city_col.is_null(0));
+    assert_eq!(count_col.value(0), 1);
+
+    // Chicago: 1 person (Charlie)
+    assert_eq!(city_col.value(1), "Chicago");
+    assert_eq!(count_col.value(1), 1);
+
+    // New York: 1 person (Alice)
+    assert_eq!(city_col.value(2), "New York");
+    assert_eq!(count_col.value(2), 1);
+
+    // San Francisco: 1 person (Bob)
+    assert_eq!(city_col.value(3), "San Francisco");
+    assert_eq!(count_col.value(3), 1);
+
+    // Seattle: 1 person (Eve)
+    assert_eq!(city_col.value(4), "Seattle");
+    assert_eq!(count_col.value(4), 1);
+}
+
+#[tokio::test]
+async fn test_count_without_alias_has_descriptive_name() {
+    let person_batch = create_person_dataset();
+    let config = GraphConfig::builder()
+        .with_node_label("Person", "id")
+        .build()
+        .unwrap();
+
+    let query = CypherQuery::new("MATCH (p:Person) RETURN count(*)")
+        .unwrap()
+        .with_config(config);
+
+    let mut datasets = HashMap::new();
+    datasets.insert("Person".to_string(), person_batch);
+
+    let result = query.execute_datafusion(datasets).await.unwrap();
+
+    assert_eq!(result.num_rows(), 1);
+    // Should have column named "count(*)" not "expr" or "count"
+    let count_col = result.column_by_name("count(*)");
+    assert!(
+        count_col.is_some(),
+        "Expected column named 'count(*)' but schema is: {:?}",
+        result.schema()
+    );
+}
+
+#[tokio::test]
+async fn test_count_property_without_alias_has_descriptive_name() {
+    let person_batch = create_person_dataset();
+    let config = GraphConfig::builder()
+        .with_node_label("Person", "id")
+        .build()
+        .unwrap();
+
+    let query = CypherQuery::new("MATCH (p:Person) RETURN count(p.name)")
+        .unwrap()
+        .with_config(config);
+
+    let mut datasets = HashMap::new();
+    datasets.insert("Person".to_string(), person_batch);
+
+    let result = query.execute_datafusion(datasets).await.unwrap();
+
+    assert_eq!(result.num_rows(), 1);
+    // Should have column named "count(p.name)" not "expr"
+    let count_col = result.column_by_name("count(p.name)");
+    assert!(
+        count_col.is_some(),
+        "Expected column named 'count(p.name)' but schema is: {:?}",
+        result.schema()
+    );
+}
