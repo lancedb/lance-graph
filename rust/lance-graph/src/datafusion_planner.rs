@@ -22,6 +22,7 @@ use datafusion::logical_expr::{
     col, lit, BinaryExpr, Expr, JoinType, LogicalPlan, LogicalPlanBuilder, Operator,
 };
 use datafusion_functions_aggregate::count::count;
+use datafusion_functions_aggregate::sum::sum;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -1536,6 +1537,16 @@ impl DataFusionPlanner {
 
                             // Use DataFusion's count helper function
                             count(arg_expr)
+                        } else {
+                            // Invalid argument count - return placeholder
+                            lit(0)
+                        }
+                    }
+                    "sum" => {
+                        if args.len() == 1 {
+                            let arg_expr = Self::to_df_value_expr(&args[0]);
+                            // Use DataFusion's sum helper function
+                            sum(arg_expr)
                         } else {
                             // Invalid argument count - return placeholder
                             lit(0)
