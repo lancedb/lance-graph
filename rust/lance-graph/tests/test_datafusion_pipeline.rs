@@ -2611,10 +2611,6 @@ async fn test_count_property_without_alias_has_descriptive_name() {
     );
 }
 
-// ============================================================================
-// SUM Aggregation Tests
-// ============================================================================
-
 #[tokio::test]
 async fn test_sum_property() {
     let person_batch = create_person_dataset();
