@@ -2746,3 +2746,169 @@ async fn test_sum_without_alias_has_descriptive_name() {
         result.schema()
     );
 }
+
+// ============================================================================
+// Disconnected Pattern (Join) Tests
+// ============================================================================
+
+#[tokio::test]
+async fn test_datafusion_disconnected_patterns_cross_join() {
+    // Test: MATCH (a:Person), (b:Person) - Cartesian product
+    // This creates a cross join between two disconnected patterns
+    let config = create_graph_config();
+    let person_batch = create_person_dataset();
+
+    let query = CypherQuery::new(
+        "MATCH (a:Person), (b:Person) WHERE a.id = 1 AND b.id = 2 RETURN a.name, b.name",
+    )
+    .unwrap()
+    .with_config(config);
+
+    let mut datasets = HashMap::new();
+    datasets.insert("Person".to_string(), person_batch);
+
+    let result = query.execute_datafusion(datasets).await.unwrap();
+
+    // Should return Alice and Bob
+    assert_eq!(result.num_rows(), 1);
+    assert_eq!(result.num_columns(), 2);
+
+    let a_names = result
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let b_names = result
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+
+    assert_eq!(a_names.value(0), "Alice");
+    assert_eq!(b_names.value(0), "Bob");
+}
+
+#[tokio::test]
+async fn test_datafusion_disconnected_patterns_multiple_results() {
+    // Test: Multiple disconnected patterns with filtering
+    // MATCH (a:Person), (b:Person) WHERE a.age > 30 AND b.age < 30
+    let config = create_graph_config();
+    let person_batch = create_person_dataset();
+
+    let query = CypherQuery::new(
+        "MATCH (a:Person), (b:Person) WHERE a.age > 30 AND b.age < 30 RETURN a.name, b.name",
+    )
+    .unwrap()
+    .with_config(config);
+
+    let mut datasets = HashMap::new();
+    datasets.insert("Person".to_string(), person_batch);
+
+    let result = query.execute_datafusion(datasets).await.unwrap();
+
+    // a.age > 30: Bob(35), David(40) = 2 people
+    // b.age < 30: Alice(25), Eve(28) = 2 people
+    // Cross product: 2 * 2 = 4 combinations
+    assert_eq!(result.num_rows(), 4);
+    assert_eq!(result.num_columns(), 2);
+
+    let a_names = result
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let b_names = result
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+
+    // Verify all combinations exist
+    let mut combinations = std::collections::HashSet::new();
+    for i in 0..result.num_rows() {
+        combinations.insert((a_names.value(i).to_string(), b_names.value(i).to_string()));
+    }
+
+    assert!(combinations.contains(&("Bob".to_string(), "Alice".to_string())));
+    assert!(combinations.contains(&("Bob".to_string(), "Eve".to_string())));
+    assert!(combinations.contains(&("David".to_string(), "Alice".to_string())));
+    assert!(combinations.contains(&("David".to_string(), "Eve".to_string())));
+}
+
+#[tokio::test]
+async fn test_datafusion_mixed_connected_and_disconnected() {
+    // Test: Mix of connected pattern and disconnected pattern
+    // MATCH (a:Person)-[:KNOWS]->(b:Person), (c:Person) WHERE c.age = 25
+    // This should join the relationship traversal with a separate node scan
+    let config = create_graph_config();
+    let person_batch = create_person_dataset();
+    let knows_batch = create_knows_dataset();
+
+    let query = CypherQuery::new(
+        "MATCH (a:Person)-[:KNOWS]->(b:Person), (c:Person) \
+         WHERE c.age = 25 \
+         RETURN a.name, b.name, c.name",
+    )
+    .unwrap()
+    .with_config(config);
+
+    let mut datasets = HashMap::new();
+    datasets.insert("Person".to_string(), person_batch);
+    datasets.insert("KNOWS".to_string(), knows_batch);
+
+    let result = query.execute_datafusion(datasets).await.unwrap();
+
+    // 5 KNOWS relationships * 1 person with age=25 (Alice) = 5 rows
+    assert_eq!(result.num_rows(), 5);
+    assert_eq!(result.num_columns(), 3);
+
+    let c_names = result
+        .column(2)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+
+    // All c.name values should be "Alice" (age 25)
+    for i in 0..result.num_rows() {
+        assert_eq!(c_names.value(i), "Alice");
+    }
+}
+
+#[tokio::test]
+async fn test_datafusion_disconnected_with_distinct() {
+    // Test: Disconnected patterns with DISTINCT
+    // MATCH (a:Person), (b:Person) WHERE a.id < b.id RETURN DISTINCT a.name
+    let config = create_graph_config();
+    let person_batch = create_person_dataset();
+
+    let query =
+        CypherQuery::new("MATCH (a:Person), (b:Person) WHERE a.id < b.id RETURN DISTINCT a.name")
+            .unwrap()
+            .with_config(config);
+
+    let mut datasets = HashMap::new();
+    datasets.insert("Person".to_string(), person_batch);
+
+    let result = query.execute_datafusion(datasets).await.unwrap();
+
+    // IDs: 1,2,3,4,5
+    // Pairs where a.id < b.id: (1,2), (1,3), (1,4), (1,5), (2,3), (2,4), (2,5), (3,4), (3,5), (4,5)
+    // Distinct a names: Alice(1), Bob(2), Charlie(3), David(4)
+    assert_eq!(result.num_rows(), 4);
+    assert_eq!(result.num_columns(), 1);
+
+    let names = result
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let name_set: std::collections::HashSet<String> = (0..result.num_rows())
+        .map(|i| names.value(i).to_string())
+        .collect();
+
+    let expected: std::collections::HashSet<String> = ["Alice", "Bob", "Charlie", "David"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(name_set, expected);
+}

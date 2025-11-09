@@ -1011,3 +1011,133 @@ async fn test_distinct_composite_keys() {
     // Key insight: Even though both Mira and Zed are in Infra team,
     // DISTINCT (t.name, tool.name) deduplicates to show each (team, tool) pair only once
 }
+
+#[tokio::test]
+async fn test_disconnected_animals_cross_join() {
+    // Test: Find all pairs of animals with different leg counts
+    // MATCH (a:Animal), (b:Animal) WHERE a.legs != b.legs
+    let graph = animals_graph();
+    let result = execute_query(
+        graph,
+        "MATCH (a:Animal), (b:Animal) WHERE a.legs != b.legs RETURN a.name, b.name",
+    )
+    .await;
+
+    // Animals: Ant(6), Bird(2), Cat(4), Dog(4), Elephant(4)
+    // Pairs with different legs:
+    // - Ant(6) with: Bird(2), Cat(4), Dog(4), Elephant(4) = 4
+    // - Bird(2) with: Ant(6), Cat(4), Dog(4), Elephant(4) = 4
+    // - Cat(4) with: Ant(6), Bird(2) = 2
+    // - Dog(4) with: Ant(6), Bird(2) = 2
+    // - Elephant(4) with: Ant(6), Bird(2) = 2
+    // Total: 14 pairs
+    assert_eq!(result.num_rows(), 14);
+    assert_eq!(result.num_columns(), 2);
+}
+
+#[tokio::test]
+async fn test_disconnected_planets_discovery_comparison() {
+    // Test: Compare discovery years of different planets
+    // MATCH (p1:Planet), (p2:Planet) WHERE p1.discovery_year < p2.discovery_year AND p1.habitable = false AND p2.habitable = true
+    let graph = planets_graph();
+    let result = execute_query(
+        graph,
+        "MATCH (p1:Planet), (p2:Planet) \
+         WHERE p1.discovery_year < p2.discovery_year AND p1.habitable = false AND p2.habitable = true \
+         RETURN p1.name, p2.name"
+    ).await;
+
+    // Non-habitable planets: Mercury(1631), Mars(1659), Neptune(1846)
+    // Habitable planets: Kepler-22b(2011), TRAPPIST-1d(2017)
+    // Valid pairs (p1.year < p2.year):
+    // - Mercury(1631) with: Kepler-22b(2011), TRAPPIST-1d(2017) = 2
+    // - Mars(1659) with: Kepler-22b(2011), TRAPPIST-1d(2017) = 2
+    // - Neptune(1846) with: Kepler-22b(2011), TRAPPIST-1d(2017) = 2
+    // Total: 6 pairs
+    assert_eq!(result.num_rows(), 6);
+    assert_eq!(result.num_columns(), 2);
+
+    let p1_names = result
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let p2_names = result
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+
+    // Verify at least one expected pair
+    let mut found_mercury_kepler = false;
+    for i in 0..result.num_rows() {
+        if p1_names.value(i) == "Mercury" && p2_names.value(i) == "Kepler-22b" {
+            found_mercury_kepler = true;
+        }
+    }
+    assert!(
+        found_mercury_kepler,
+        "Should find Mercury -> Kepler-22b pair"
+    );
+}
+
+#[tokio::test]
+async fn test_disconnected_animals_species_filter() {
+    // Test: Cross join with species filtering
+    // MATCH (a:Animal {species: 'Mammal'}), (b:Animal {species: 'Insect'})
+    let graph = animals_graph();
+    let result = execute_query(
+        graph,
+        "MATCH (a:Animal {species: 'Mammal'}), (b:Animal {species: 'Insect'}) \
+         RETURN a.name, b.name",
+    )
+    .await;
+
+    // Mammals: Elephant
+    // Insects: Ant
+    // Only 1 combination: Elephant-Ant
+    assert_eq!(result.num_rows(), 1);
+    assert_eq!(result.num_columns(), 2);
+
+    let a_names = result
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let b_names = result
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+
+    assert_eq!(a_names.value(0), "Elephant");
+    assert_eq!(b_names.value(0), "Ant");
+}
+
+#[tokio::test]
+async fn test_disconnected_with_aggregation() {
+    // Test: Disconnected patterns with aggregation
+    // MATCH (a:Animal), (b:Animal) WHERE a.legs > b.legs RETURN COUNT(*)
+    let graph = animals_graph();
+    let result = execute_query(
+        graph,
+        "MATCH (a:Animal), (b:Animal) WHERE a.legs > b.legs RETURN COUNT(*) AS pair_count",
+    )
+    .await;
+
+    // Pairs where a.legs > b.legs:
+    // - Ant(6) > Bird(2), Cat(4), Dog(4), Elephant(4) = 4
+    // - Cat(4) > Bird(2) = 1
+    // - Dog(4) > Bird(2) = 1
+    // - Elephant(4) > Bird(2) = 1
+    // Total: 7 pairs
+    assert_eq!(result.num_rows(), 1);
+    assert_eq!(result.num_columns(), 1);
+
+    let count = result
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(count.value(0), 7);
+}
