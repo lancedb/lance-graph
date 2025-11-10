@@ -223,6 +223,10 @@ pub enum BooleanExpression {
         expression: ValueExpression,
         pattern: String,
     },
+    /// IS NULL pattern matching
+    IsNull(ValueExpression),
+    /// IS NOT NULL pattern matching
+    IsNotNull(ValueExpression),
 }
 
 /// Comparison operators

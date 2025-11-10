@@ -247,6 +247,12 @@ impl SemanticAnalyzer {
             BooleanExpression::Like { expression, .. } => {
                 self.analyze_value_expression(expression)?;
             }
+            BooleanExpression::IsNull(expression) => {
+                self.analyze_value_expression(expression)?;
+            }
+            BooleanExpression::IsNotNull(expression) => {
+                self.analyze_value_expression(expression)?;
+            }
         }
         Ok(())
     }
