@@ -879,6 +879,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn test_parse_query_with_is_not_null() {
         let query = "MATCH (n:Person) WHERE n.age IS NOT NULL RETURN n.name";
         let result = parse_cypher_query(query).unwrap();
