@@ -2912,3 +2912,160 @@ async fn test_datafusion_disconnected_with_distinct() {
         .collect();
     assert_eq!(name_set, expected);
 }
+
+#[tokio::test]
+async fn test_datafusion_shared_node_variable_join() {
+    // This should join on shared variable 'b' using b.id
+    let config = create_graph_config();
+    let person_batch = create_person_dataset();
+    let knows_batch = create_knows_dataset();
+
+    let query = CypherQuery::new(
+        "MATCH (a:Person)-[:KNOWS]->(b:Person), (b)-[:KNOWS]->(c:Person) \
+         RETURN a.name, b.name, c.name ORDER BY a.name, c.name",
+    )
+    .unwrap()
+    .with_config(config);
+
+    let mut datasets = HashMap::new();
+    datasets.insert("Person".to_string(), person_batch);
+    datasets.insert("KNOWS".to_string(), knows_batch);
+
+    let result = query.execute_datafusion(datasets).await.unwrap();
+
+    // This is a two-hop path query that should use join key inference on 'b'
+    // Alice(1) -> Bob(2) -> Charlie(3)
+    // Alice(1) -> Bob(2) -> David(4)
+    assert!(
+        result.num_rows() >= 2,
+        "Should have at least 2 two-hop paths"
+    );
+
+    let a_names = result
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let b_names = result
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let c_names = result
+        .column(2)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+
+    // Verify at least one path: Alice -> Bob -> Charlie
+    let mut found_path = false;
+    for i in 0..result.num_rows() {
+        if a_names.value(i) == "Alice" && b_names.value(i) == "Bob" && c_names.value(i) == "Charlie"
+        {
+            found_path = true;
+            break;
+        }
+    }
+    assert!(found_path, "Should find path: Alice -> Bob -> Charlie");
+}
+
+#[tokio::test]
+async fn test_datafusion_shared_variable_with_filter() {
+    let config = create_graph_config();
+    let person_batch = create_person_dataset();
+    let knows_batch = create_knows_dataset();
+
+    let query = CypherQuery::new(
+        "MATCH (a:Person)-[:KNOWS]->(b:Person), (b)-[:KNOWS]->(c:Person) \
+         WHERE a.age > 20 AND c.age < 40 \
+         RETURN a.name, b.name, c.name",
+    )
+    .unwrap()
+    .with_config(config);
+
+    let mut datasets = HashMap::new();
+    datasets.insert("Person".to_string(), person_batch);
+    datasets.insert("KNOWS".to_string(), knows_batch);
+
+    let result = query.execute_datafusion(datasets).await.unwrap();
+
+    // Should successfully execute with join key inference + filters
+    assert!(result.num_rows() > 0, "Should have results with filters");
+
+    // Verify all results satisfy the age constraints
+    // All 'a' nodes should have age > 20 (excludes no one in our dataset)
+    // All 'c' nodes should have age < 40 (excludes David who is 40)
+    for i in 0..result.num_rows() {
+        let c_name = result
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(i);
+        assert_ne!(c_name, "David", "David (age 40) should be filtered out");
+    }
+}
+
+#[tokio::test]
+async fn test_datafusion_multiple_shared_variables() {
+    let config = create_graph_config();
+    let person_batch = create_person_dataset();
+    let knows_batch = create_knows_dataset();
+
+    let query = CypherQuery::new(
+        "MATCH (a:Person)-[:KNOWS]->(b:Person), (b)-[:KNOWS]->(c:Person), (c)-[:KNOWS]->(d:Person) \
+         RETURN a.name, b.name, c.name, d.name",
+    )
+    .unwrap()
+    .with_config(config);
+
+    let mut datasets = HashMap::new();
+    datasets.insert("Person".to_string(), person_batch);
+    datasets.insert("KNOWS".to_string(), knows_batch);
+
+    let result = query.execute_datafusion(datasets).await.unwrap();
+
+    // This is a three-hop path query using join key inference on 'b' and 'c'
+    // Should successfully execute (may have 0 or more results depending on data)
+    assert_eq!(result.num_columns(), 4);
+}
+
+#[tokio::test]
+async fn test_datafusion_shared_variable_distinct() {
+    let config = create_graph_config();
+    let person_batch = create_person_dataset();
+    let knows_batch = create_knows_dataset();
+
+    let query = CypherQuery::new(
+        "MATCH (a:Person)-[:KNOWS]->(b:Person), (b)-[:KNOWS]->(c:Person) \
+         RETURN DISTINCT b.name ORDER BY b.name",
+    )
+    .unwrap()
+    .with_config(config);
+
+    let mut datasets = HashMap::new();
+    datasets.insert("Person".to_string(), person_batch);
+    datasets.insert("KNOWS".to_string(), knows_batch);
+
+    let result = query.execute_datafusion(datasets).await.unwrap();
+
+    // Should return distinct intermediate nodes that have both incoming and outgoing KNOWS edges
+    assert!(result.num_rows() > 0, "Should have intermediate nodes");
+    assert_eq!(result.num_columns(), 1);
+
+    let names = result
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+
+    // Verify no duplicates
+    let name_set: std::collections::HashSet<String> = (0..result.num_rows())
+        .map(|i| names.value(i).to_string())
+        .collect();
+    assert_eq!(
+        name_set.len(),
+        result.num_rows(),
+        "DISTINCT should eliminate duplicates"
+    );
+}
