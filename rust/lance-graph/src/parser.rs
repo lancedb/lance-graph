@@ -484,6 +484,7 @@ fn return_item(input: &str) -> IResult<&str, ReturnItem> {
     ))
 }
 
+// Match IS NULL in WHERE clause
 fn is_null_comparison(input: &str) -> IResult<&str, ()> {
     let (input, _) = multispace0(input)?;
     let (input, _) = tag_no_case("IS")(input)?;
@@ -494,6 +495,7 @@ fn is_null_comparison(input: &str) -> IResult<&str, ()> {
     Ok((input, ()))
 }
 
+// Match IS NOT NULL in WHERE clause
 fn is_not_null_comparison(input: &str) -> IResult<&str, ()> {
     let (input, _) = multispace0(input)?;
     let (input, _) = tag_no_case("IS")(input)?;
