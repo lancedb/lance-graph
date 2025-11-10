@@ -868,15 +868,13 @@ mod tests {
         let where_clause = result.where_clause.expect("Expected WHERE clause");
 
         match where_clause.expression {
-            BooleanExpression::IsNull(expr) => {
-                match expr {
-                    ValueExpression::Property(prop_ref) => {
-                        assert_eq!(prop_ref.variable, "n");
-                        assert_eq!(prop_ref.property, "age");
-                    }
-                    _ => panic!("Expected property reference in IS NULL expression"),
+            BooleanExpression::IsNull(expr) => match expr {
+                ValueExpression::Property(prop_ref) => {
+                    assert_eq!(prop_ref.variable, "n");
+                    assert_eq!(prop_ref.property, "age");
                 }
-            }
+                _ => panic!("Expected property reference in IS NULL expression"),
+            },
             other => panic!("Expected IS NULL expression, got {:?}", other),
         }
     }
@@ -888,15 +886,13 @@ mod tests {
         let where_clause = result.where_clause.expect("Expected WHERE clause");
 
         match where_clause.expression {
-            BooleanExpression::IsNotNull(expr) => {
-                match expr {
-                    ValueExpression::Property(prop_ref) => {
-                        assert_eq!(prop_ref.variable, "n");
-                        assert_eq!(prop_ref.property, "age");
-                    }
-                    _ => panic!("Expected property reference in IS NOT NULL expression"),
+            BooleanExpression::IsNotNull(expr) => match expr {
+                ValueExpression::Property(prop_ref) => {
+                    assert_eq!(prop_ref.variable, "n");
+                    assert_eq!(prop_ref.property, "age");
                 }
-            }
+                _ => panic!("Expected property reference in IS NOT NULL expression"),
+            },
             other => panic!("Expected IS NOT NULL expression, got {:?}", other),
         }
     }
