@@ -329,6 +329,14 @@ fn comparison_expression(input: &str) -> IResult<&str, BooleanExpression> {
             },
         ));
     }
+    // Match is null
+    if let Ok((rest, ())) = is_null_comparison(input) {
+        return Ok((rest, BooleanExpression::IsNull(left_clone)));
+    }
+    // Match is not null
+    if let Ok((rest, ())) = is_not_null_comparison(input) {
+        return Ok((rest, BooleanExpression::IsNotNull(left_clone)));
+    }
 
     let (input, operator) = comparison_operator(input)?;
     let (input, _) = multispace0(input)?;
@@ -474,6 +482,28 @@ fn return_item(input: &str) -> IResult<&str, ReturnItem> {
             alias: alias.map(|s| s.to_string()),
         },
     ))
+}
+
+fn is_null_comparison(input: &str) -> IResult<&str, ()> {
+    let (input, _) = multispace0(input)?;
+    let (input, _) = tag_no_case("IS")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, _) = tag_no_case("NULL")(input)?;
+    let (input, _) = multispace0(input)?;
+
+    Ok((input, ()))
+}
+
+fn is_not_null_comparison(input: &str) -> IResult<&str, ()> {
+    let (input, _) = multispace0(input)?;
+    let (input, _) = tag_no_case("IS")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, _) = tag_no_case("NOT")(input)?;
+    let (input, _) = multispace1(input)?;
+    let (input, _) = tag_no_case("NULL")(input)?;
+    let (input, _) = multispace0(input)?;
+
+    Ok((input, ()))
 }
 
 // Parse an ORDER BY clause
@@ -825,6 +855,47 @@ mod tests {
                 }
             }
             other => panic!("Expected IN expression, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_query_with_is_null() {
+        let query = "MATCH (n:Person) WHERE n.age IS NULL RETURN n.name";
+        let result = parse_cypher_query(query).unwrap();
+
+        let where_clause = result.where_clause.expect("Expected WHERE clause");
+
+        match where_clause.expression {
+            BooleanExpression::IsNull(expr) => {
+                match expr {
+                    ValueExpression::Property(prop_ref) => {
+                        assert_eq!(prop_ref.variable, "n");
+                        assert_eq!(prop_ref.property, "age");
+                    }
+                    _ => panic!("Expected property reference in IS NULL expression"),
+                }
+            }
+            other => panic!("Expected IS NULL expression, got {:?}", other),
+        }
+    }
+
+    fn test_parse_query_with_is_not_null() {
+        let query = "MATCH (n:Person) WHERE n.age IS NOT NULL RETURN n.name";
+        let result = parse_cypher_query(query).unwrap();
+
+        let where_clause = result.where_clause.expect("Expected WHERE clause");
+
+        match where_clause.expression {
+            BooleanExpression::IsNotNull(expr) => {
+                match expr {
+                    ValueExpression::Property(prop_ref) => {
+                        assert_eq!(prop_ref.variable, "n");
+                        assert_eq!(prop_ref.property, "age");
+                    }
+                    _ => panic!("Expected property reference in IS NOT NULL expression"),
+                }
+            }
+            other => panic!("Expected IS NOT NULL expression, got {:?}", other),
         }
     }
 
