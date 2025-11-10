@@ -829,6 +829,79 @@ async fn test_engineers_two_hop_path_with_filter() {
 }
 
 #[tokio::test]
+async fn test_engineers_shared_team_join() {
+    let graph = engineers_graph();
+    let result = execute_query(
+        graph,
+        "MATCH (e:Engineer)-[:MEMBER_OF]->(t:Team), (t)-[:USES]->(tool:Tool) \
+         RETURN DISTINCT t.name, tool.name \
+         ORDER BY t.name, tool.name",
+    )
+    .await;
+
+    // Teams and their tools
+    assert_eq!(result.num_columns(), 2);
+    assert_eq!(result.num_rows(), 3); // Storage->Rust, Infra->Kotlin, Infra->Scala
+
+    let team_names = result
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let tool_names = result
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+
+    assert_eq!(team_names.value(0), "Infra");
+    assert_eq!(tool_names.value(0), "Kotlin");
+
+    assert_eq!(team_names.value(1), "Infra");
+    assert_eq!(tool_names.value(1), "Scala");
+
+    assert_eq!(team_names.value(2), "Storage");
+    assert_eq!(tool_names.value(2), "Rust");
+}
+
+#[tokio::test]
+async fn test_books_shared_author_join() {
+    let graph = books_graph();
+    let result = execute_query(
+        graph,
+        "MATCH (a:Author)-[:WROTE]->(b1:Book), (a)-[:WROTE]->(b2:Book) \
+         WHERE b1.title < b2.title \
+         RETURN a.name, b1.title, b2.title \
+         ORDER BY a.name, b1.title",
+    )
+    .await;
+
+    // Terry Pratchett wrote 2 books: Good Omens and The Last Continent
+    assert_eq!(result.num_columns(), 3);
+    assert_eq!(result.num_rows(), 1);
+
+    let author_names = result
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let book1_titles = result
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let book2_titles = result
+        .column(2)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+
+    assert_eq!(author_names.value(0), "Terry Pratchett");
+    assert_eq!(book1_titles.value(0), "Good Omens");
+    assert_eq!(book2_titles.value(0), "The Last Continent");
+}
+
+#[tokio::test]
 async fn test_suppliers_relationship_ordering() {
     let graph = suppliers_graph();
     let result = execute_query(
