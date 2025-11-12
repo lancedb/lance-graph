@@ -7,6 +7,7 @@
 
 use crate::ast::{BooleanExpression, PropertyValue, ValueExpression};
 use datafusion::logical_expr::{col, lit, BinaryExpr, Expr, Operator};
+use datafusion_functions_aggregate::average::avg;
 use datafusion_functions_aggregate::count::count;
 use datafusion_functions_aggregate::sum::sum;
 
@@ -87,14 +88,18 @@ pub(crate) fn to_df_value_expr(expr: &ValueExpression) -> Expr {
             match name.to_lowercase().as_str() {
                 "count" => {
                     if args.len() == 1 {
-                        // Check for COUNT(*)
                         let arg_expr = if let VE::Variable(v) = &args[0] {
                             if v == "*" {
+                                // COUNT(*) - count all rows including NULLs
                                 lit(1)
                             } else {
-                                to_df_value_expr(&args[0])
+                                // COUNT(p) - count non-NULL rows by using a representative column
+                                // Use <variable>__id as a null-sensitive column
+                                // This ensures optional matches with NULL variables are not counted
+                                col(format!("{}__id", v))
                             }
                         } else {
+                            // COUNT(p.property) - count non-null values of that property
                             to_df_value_expr(&args[0])
                         };
 
@@ -107,11 +112,20 @@ pub(crate) fn to_df_value_expr(expr: &ValueExpression) -> Expr {
                 }
                 "sum" => {
                     if args.len() == 1 {
+                        // Note: SUM(variable) is rejected by semantic validation
+                        // So we only handle valid cases here
                         let arg_expr = to_df_value_expr(&args[0]);
-                        // Use DataFusion's sum helper function
                         sum(arg_expr)
                     } else {
                         // Invalid argument count - return placeholder
+                        lit(0)
+                    }
+                }
+                "avg" => {
+                    if args.len() == 1 {
+                        let arg_expr = to_df_value_expr(&args[0]);
+                        avg(arg_expr)
+                    } else {
                         lit(0)
                     }
                 }
@@ -516,6 +530,25 @@ mod tests {
         assert!(
             s.contains("sum") || s.contains("Sum"),
             "Should be SUM function"
+        );
+        assert!(s.contains("p__amount"), "Should contain column reference");
+    }
+
+    #[test]
+    fn test_value_expr_function_avg() {
+        let expr = ValueExpression::Function {
+            name: "AVG".into(),
+            args: vec![ValueExpression::Property(PropertyRef {
+                variable: "p".into(),
+                property: "amount".into(),
+            })],
+        };
+
+        let df_expr = to_df_value_expr(&expr);
+        let s = format!("{:?}", df_expr);
+        assert!(
+            s.contains("avg") || s.contains("Avg"),
+            "Should be AVG function"
         );
         assert!(s.contains("p__amount"), "Should contain column reference");
     }

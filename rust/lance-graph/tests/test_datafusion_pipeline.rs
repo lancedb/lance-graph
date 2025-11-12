@@ -1,4 +1,4 @@
-use arrow_array::{Array, Int64Array, RecordBatch, StringArray};
+use arrow_array::{Array, Float64Array, Int64Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema};
 use lance_graph::config::GraphConfig;
 use lance_graph::query::CypherQuery;
@@ -2447,6 +2447,34 @@ async fn test_count_star_all_nodes() {
 }
 
 #[tokio::test]
+async fn test_count_variable() {
+    let person_batch = create_person_dataset();
+    let config = GraphConfig::builder()
+        .with_node_label("Person", "id")
+        .build()
+        .unwrap();
+
+    let query = CypherQuery::new("MATCH (p:Person) RETURN count(p) AS total")
+        .unwrap()
+        .with_config(config);
+
+    let mut datasets = HashMap::new();
+    datasets.insert("Person".to_string(), person_batch);
+
+    let result = query.execute_datafusion(datasets).await.unwrap();
+
+    assert_eq!(result.num_rows(), 1);
+    let count_col = result
+        .column_by_name("total")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    // count(p) should work like count(*) - count all rows
+    assert_eq!(count_col.value(0), 5);
+}
+
+#[tokio::test]
 async fn test_count_with_filter() {
     let person_batch = create_person_dataset();
     let config = GraphConfig::builder()
@@ -2743,6 +2771,143 @@ async fn test_sum_without_alias_has_descriptive_name() {
     assert!(
         sum_col.is_some(),
         "Expected column named 'sum(p.age)' but schema is: {:?}",
+        result.schema()
+    );
+}
+
+#[tokio::test]
+async fn test_avg_property() {
+    let person_batch = create_person_dataset();
+    let config = GraphConfig::builder()
+        .with_node_label("Person", "id")
+        .build()
+        .unwrap();
+
+    let query = CypherQuery::new("MATCH (p:Person) RETURN avg(p.age) AS average_age")
+        .unwrap()
+        .with_config(config);
+
+    let mut datasets = HashMap::new();
+    datasets.insert("Person".to_string(), person_batch);
+
+    let result = query.execute_datafusion(datasets).await.unwrap();
+
+    assert_eq!(result.num_rows(), 1);
+    let avg_col = result
+        .column_by_name("average_age")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    // Average of ages: (25 + 35 + 30 + 40 + 28) / 5 = 158 / 5 = 31.6
+    assert_eq!(avg_col.value(0), 31.6);
+}
+
+#[tokio::test]
+async fn test_avg_with_filter() {
+    let person_batch = create_person_dataset();
+    let config = GraphConfig::builder()
+        .with_node_label("Person", "id")
+        .build()
+        .unwrap();
+
+    let query =
+        CypherQuery::new("MATCH (p:Person) WHERE p.age >= 30 RETURN avg(p.age) AS average_age")
+            .unwrap()
+            .with_config(config);
+
+    let mut datasets = HashMap::new();
+    datasets.insert("Person".to_string(), person_batch);
+
+    let result = query.execute_datafusion(datasets).await.unwrap();
+
+    assert_eq!(result.num_rows(), 1);
+    let avg_col = result
+        .column_by_name("average_age")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    // Average of ages >= 30: (35 + 30 + 40) / 3 = 105 / 3 = 35.0
+    assert_eq!(avg_col.value(0), 35.0);
+}
+
+#[tokio::test]
+async fn test_avg_with_grouping() {
+    let person_batch = create_person_dataset();
+    let config = GraphConfig::builder()
+        .with_node_label("Person", "id")
+        .build()
+        .unwrap();
+
+    let query = CypherQuery::new(
+        "MATCH (p:Person) RETURN p.city, avg(p.age) AS average_age ORDER BY p.city",
+    )
+    .unwrap()
+    .with_config(config);
+
+    let mut datasets = HashMap::new();
+    datasets.insert("Person".to_string(), person_batch);
+
+    let result = query.execute_datafusion(datasets).await.unwrap();
+
+    // Should have 5 groups: NULL, Chicago, New York, San Francisco, Seattle
+    assert_eq!(result.num_rows(), 5);
+
+    let city_col = result
+        .column_by_name("p.city")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+
+    let avg_col = result
+        .column_by_name("average_age")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+
+    // Verify grouping results (ordered by city, NULL comes first)
+    assert!(city_col.is_null(0)); // David: 40 (NULL city)
+    assert_eq!(avg_col.value(0), 40.0);
+
+    assert_eq!(city_col.value(1), "Chicago"); // Charlie: 30
+    assert_eq!(avg_col.value(1), 30.0);
+
+    assert_eq!(city_col.value(2), "New York"); // Alice: 25
+    assert_eq!(avg_col.value(2), 25.0);
+
+    assert_eq!(city_col.value(3), "San Francisco"); // Bob: 35
+    assert_eq!(avg_col.value(3), 35.0);
+
+    assert_eq!(city_col.value(4), "Seattle"); // Eve: 28
+    assert_eq!(avg_col.value(4), 28.0);
+}
+
+#[tokio::test]
+async fn test_avg_without_alias_has_descriptive_name() {
+    let person_batch = create_person_dataset();
+    let config = GraphConfig::builder()
+        .with_node_label("Person", "id")
+        .build()
+        .unwrap();
+
+    let query = CypherQuery::new("MATCH (p:Person) RETURN avg(p.age)")
+        .unwrap()
+        .with_config(config);
+
+    let mut datasets = HashMap::new();
+    datasets.insert("Person".to_string(), person_batch);
+
+    let result = query.execute_datafusion(datasets).await.unwrap();
+
+    assert_eq!(result.num_rows(), 1);
+    // Should have column named "avg(p.age)" not "expr"
+    let avg_col = result.column_by_name("avg(p.age)");
+    assert!(
+        avg_col.is_some(),
+        "Expected column named 'avg(p.age)' but schema is: {:?}",
         result.schema()
     );
 }

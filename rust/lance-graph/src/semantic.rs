@@ -288,6 +288,20 @@ impl SemanticAnalyzer {
                                 location: snafu::Location::new(file!(), line!(), column!()),
                             });
                         }
+
+                        // Additional validation for SUM, AVG, MIN, MAX: they require properties, not bare variables
+                        // Only COUNT allows bare variables (COUNT(*) or COUNT(p))
+                        if matches!(name.to_lowercase().as_str(), "sum" | "avg" | "min" | "max") {
+                            if let Some(ValueExpression::Variable(v)) = args.first() {
+                                return Err(GraphError::PlanError {
+                                    message: format!(
+                                        "{}({}) is invalid - {} requires a property like {}({}.property). You cannot {} a node/entity.",
+                                        name.to_uppercase(), v, name.to_uppercase(), name.to_uppercase(), v, name.to_lowercase()
+                                    ),
+                                    location: snafu::Location::new(file!(), line!(), column!()),
+                                });
+                            }
+                        }
                     }
                     _ => {
                         // Other functions - no validation yet
@@ -953,6 +967,136 @@ mod tests {
                 .iter()
                 .all(|e| !e.contains("COUNT requires exactly 1 argument")),
             "COUNT with 1 arg should not produce arity error, got: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn test_sum_with_variable_fails_validation() {
+        let expr = ValueExpression::Function {
+            name: "sum".to_string(),
+            args: vec![ValueExpression::Variable("n".to_string())],
+        };
+        let result = analyze_return_with_match("n", "Person", expr).unwrap();
+        assert!(
+            !result.errors.is_empty(),
+            "Expected SUM(variable) to produce validation errors"
+        );
+        let has_sum_error = result
+            .errors
+            .iter()
+            .any(|e| e.contains("SUM(n) is invalid") && e.contains("requires a property"));
+        assert!(
+            has_sum_error,
+            "Expected error about SUM requiring property, got: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn test_avg_with_variable_fails_validation() {
+        let expr = ValueExpression::Function {
+            name: "avg".to_string(),
+            args: vec![ValueExpression::Variable("n".to_string())],
+        };
+        let result = analyze_return_with_match("n", "Person", expr).unwrap();
+        assert!(
+            !result.errors.is_empty(),
+            "Expected AVG(variable) to produce validation errors"
+        );
+        let has_avg_error = result
+            .errors
+            .iter()
+            .any(|e| e.contains("AVG(n) is invalid") && e.contains("requires a property"));
+        assert!(
+            has_avg_error,
+            "Expected error about AVG requiring property, got: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn test_sum_with_property_passes_validation() {
+        let expr = ValueExpression::Function {
+            name: "sum".to_string(),
+            args: vec![ValueExpression::Property(PropertyRef::new("n", "age"))],
+        };
+        let result = analyze_return_with_match("n", "Person", expr).unwrap();
+        assert!(
+            result.errors.is_empty(),
+            "SUM with property should pass validation, got errors: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn test_min_with_variable_fails_validation() {
+        let expr = ValueExpression::Function {
+            name: "min".to_string(),
+            args: vec![ValueExpression::Variable("n".to_string())],
+        };
+        let result = analyze_return_with_match("n", "Person", expr).unwrap();
+        assert!(
+            !result.errors.is_empty(),
+            "Expected MIN(variable) to produce validation errors"
+        );
+        let has_min_error = result
+            .errors
+            .iter()
+            .any(|e| e.contains("MIN(n) is invalid") && e.contains("requires a property"));
+        assert!(
+            has_min_error,
+            "Expected error about MIN requiring property, got: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn test_max_with_variable_fails_validation() {
+        let expr = ValueExpression::Function {
+            name: "max".to_string(),
+            args: vec![ValueExpression::Variable("n".to_string())],
+        };
+        let result = analyze_return_with_match("n", "Person", expr).unwrap();
+        assert!(
+            !result.errors.is_empty(),
+            "Expected MAX(variable) to produce validation errors"
+        );
+        let has_max_error = result
+            .errors
+            .iter()
+            .any(|e| e.contains("MAX(n) is invalid") && e.contains("requires a property"));
+        assert!(
+            has_max_error,
+            "Expected error about MAX requiring property, got: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn test_min_with_property_passes_validation() {
+        let expr = ValueExpression::Function {
+            name: "min".to_string(),
+            args: vec![ValueExpression::Property(PropertyRef::new("n", "age"))],
+        };
+        let result = analyze_return_with_match("n", "Person", expr).unwrap();
+        assert!(
+            result.errors.is_empty(),
+            "MIN with property should pass validation, got errors: {:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn test_max_with_property_passes_validation() {
+        let expr = ValueExpression::Function {
+            name: "max".to_string(),
+            args: vec![ValueExpression::Property(PropertyRef::new("n", "age"))],
+        };
+        let result = analyze_return_with_match("n", "Person", expr).unwrap();
+        assert!(
+            result.errors.is_empty(),
+            "MAX with property should pass validation, got errors: {:?}",
             result.errors
         );
     }
