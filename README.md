@@ -175,3 +175,7 @@ cargo bench --bench graph_execution -- --warm-up-time 1 --measurement-time 2 --s
 | two_hop_expand           | 1,000,000 | ~6.16 ms    | ~162 Melem/s       |
 
 Numbers are illustrative; your hardware, compiler, and runtime load will affect results.
+
+## External Wiki
+
+For additional documentation, architecture, and examples, see the DeepWiki page: [DeepWiki — lance-graph](https://deepwiki.com/lancedb/lance-graph)
