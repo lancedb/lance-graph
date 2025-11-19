@@ -29,7 +29,7 @@ cargo test
 cd python
 uv venv --python 3.11 .venv      # create the local virtualenv
 source .venv/bin/activate         # activate the virtual environment
-uv pip install maturin[patchelf] # install build tool
+uv pip install 'maturin[patchelf]' # install build tool
 uv pip install -e '.[tests]'     # editable install with test extras
 maturin develop                   # build and install the Rust extension
 pytest python/tests/ -v          # run the test suite
