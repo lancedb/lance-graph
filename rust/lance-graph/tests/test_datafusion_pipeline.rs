@@ -3234,3 +3234,142 @@ async fn test_datafusion_shared_variable_distinct() {
         "DISTINCT should eliminate duplicates"
     );
 }
+
+#[tokio::test]
+async fn test_datafusion_is_null_node_property() {
+    let config = create_graph_config();
+    let person_batch = create_person_dataset();
+
+    let query = CypherQuery::new("MATCH (p:Person) WHERE p.city IS NULL RETURN p.name")
+        .unwrap()
+        .with_config(config);
+
+    let mut datasets = HashMap::new();
+    datasets.insert("Person".to_string(), person_batch);
+
+    let result = query.execute_datafusion(datasets).await.unwrap();
+
+    assert_eq!(result.num_rows(), 1);
+    assert_eq!(result.num_columns(), 1);
+
+    let names = result
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(names.value(0), "David");
+}
+
+#[tokio::test]
+async fn test_datafusion_is_not_null_node_property() {
+    let config = create_graph_config();
+    let person_batch = create_person_dataset();
+
+    let query = CypherQuery::new("MATCH (p:Person) WHERE p.city IS NOT NULL RETURN p.name")
+        .unwrap()
+        .with_config(config);
+
+    let mut datasets = HashMap::new();
+    datasets.insert("Person".to_string(), person_batch);
+
+    let result = query.execute_datafusion(datasets).await.unwrap();
+
+    assert_eq!(result.num_rows(), 4);
+    assert_eq!(result.num_columns(), 1);
+
+    let names = result
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+
+    let name_set: std::collections::HashSet<String> = (0..result.num_rows())
+        .map(|i| names.value(i).to_string())
+        .collect();
+    let expected: std::collections::HashSet<String> = ["Alice", "Bob", "Charlie", "Eve"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(name_set, expected);
+}
+
+#[tokio::test]
+async fn test_datafusion_is_null_relationship_property() {
+    let config = create_graph_config();
+    let person_batch = create_person_dataset();
+    let knows_batch = create_knows_dataset();
+
+    let query = CypherQuery::new(
+        "MATCH (a:Person)-[r:KNOWS]->(b:Person) \
+         WHERE r.since_year IS NULL \
+         RETURN a.name, b.name",
+    )
+    .unwrap()
+    .with_config(config);
+
+    let mut datasets = HashMap::new();
+    datasets.insert("Person".to_string(), person_batch);
+    datasets.insert("KNOWS".to_string(), knows_batch);
+
+    let result = query.execute_datafusion(datasets).await.unwrap();
+
+    assert_eq!(result.num_rows(), 1);
+    assert_eq!(result.num_columns(), 2);
+
+    let a_names = result
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let b_names = result
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+
+    assert_eq!(a_names.value(0), "David");
+    assert_eq!(b_names.value(0), "Eve");
+}
+
+#[tokio::test]
+async fn test_datafusion_is_not_null_relationship_property() {
+    let config = create_graph_config();
+    let person_batch = create_person_dataset();
+    let knows_batch = create_knows_dataset();
+
+    let query = CypherQuery::new(
+        "MATCH (a:Person)-[r:KNOWS]->(b:Person) \
+         WHERE r.since_year IS NOT NULL \
+         RETURN a.name, b.name",
+    )
+    .unwrap()
+    .with_config(config);
+
+    let mut datasets = HashMap::new();
+    datasets.insert("Person".to_string(), person_batch);
+    datasets.insert("KNOWS".to_string(), knows_batch);
+
+    let result = query.execute_datafusion(datasets).await.unwrap();
+
+    assert_eq!(result.num_rows(), 4);
+
+    let a_names = result
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let b_names = result
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+
+    for i in 0..result.num_rows() {
+        let a = a_names.value(i);
+        let b = b_names.value(i);
+        assert!(
+            !(a == "David" && b == "Eve"),
+            "David -> Eve should be filtered out by IS NOT NULL"
+        );
+    }
+}
