@@ -1871,6 +1871,7 @@ dependencies = [
  "datafusion",
  "datafusion-common",
  "datafusion-expr",
+ "datafusion-functions-aggregate",
  "datafusion-sql",
  "lance-core",
  "nom 7.1.3",
