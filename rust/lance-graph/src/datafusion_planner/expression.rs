@@ -56,6 +56,8 @@ pub(crate) fn to_df_boolean_expr(expr: &BooleanExpression) -> Expr {
         BE::Exists(prop) => Expr::IsNotNull(Box::new(to_df_value_expr(
             &ValueExpression::Property(prop.clone()),
         ))),
+        BE::IsNull(expression) => Expr::IsNull(Box::new(to_df_value_expr(expression))),
+        BE::IsNotNull(expression) => Expr::IsNotNull(Box::new(to_df_value_expr(expression))),
         _ => lit(true),
     }
 }
