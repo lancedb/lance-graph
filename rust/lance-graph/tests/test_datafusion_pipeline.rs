@@ -3351,7 +3351,7 @@ async fn test_datafusion_is_not_null_relationship_property() {
 
     let result = query.execute_datafusion(datasets).await.unwrap();
 
-    assert_eq!(out.num_rows(), 4);
+    assert_eq!(result.num_rows(), 4);
 
     let a_names = result
         .column(0)
